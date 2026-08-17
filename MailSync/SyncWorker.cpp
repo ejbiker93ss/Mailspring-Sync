@@ -10,6 +10,7 @@
 //
 #include <algorithm>
 #include <functional>
+#include <iomanip>
 #include <set>
 
 #include "SyncWorker.hpp"
@@ -24,6 +25,8 @@
 #include "constants.h"
 #include "ProgressCollectors.hpp"
 #include "SyncException.hpp"
+#include "NetworkRequestUtils.hpp"
+#include "XOAuth2TokenManager.hpp"
 
 
 #define CACHE_CLEANUP_INTERVAL      60 * 60
@@ -53,6 +56,86 @@
 using namespace mailcore;
 using namespace std;
 
+static string graphUrlEncode(const string & value) {
+    CURL *curl = curl_easy_init();
+    char *encoded = curl_easy_escape(curl, value.c_str(), (int)value.size());
+    string result = encoded ? encoded : "";
+    if (encoded) curl_free(encoded);
+    curl_easy_cleanup(curl);
+    return result;
+}
+
+static uint32_t graphRemoteUID(const string & value) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char c : value) {
+        hash ^= c;
+        hash *= 16777619u;
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+static time_t graphDate(const string & value) {
+    if (value.empty()) return time(0);
+    tm parsed = {};
+    istringstream input(value.substr(0, 19));
+    input >> get_time(&parsed, "%Y-%m-%dT%H:%M:%S");
+    if (input.fail()) return time(0);
+#if defined(_WIN32)
+    return _mkgmtime(&parsed);
+#else
+    return timegm(&parsed);
+#endif
+}
+
+static Address * graphAddress(const json & recipient) {
+    if (!recipient.is_object() || !recipient.count("emailAddress")) return nullptr;
+    const json & email = recipient["emailAddress"];
+    string address = email.value("address", "");
+    if (address.empty()) return nullptr;
+    string name = email.value("name", "");
+    return Address::addressWithDisplayName(AS_MCSTR(name), AS_MCSTR(address));
+}
+
+static Array * graphAddresses(const json & recipients) {
+    Array * result = new Array();
+    if (recipients.is_array()) {
+        for (const auto & recipient : recipients) {
+            Address * address = graphAddress(recipient);
+            if (address) result->addObject(address);
+        }
+    }
+    return result;
+}
+
+static IMAPMessage * graphMessage(const json & remote) {
+    IMAPMessage * message = new IMAPMessage();
+    const string graphId = remote.value("id", "");
+    message->setUid(graphRemoteUID(graphId));
+
+    MessageFlag flags = MessageFlagNone;
+    if (remote.value("isRead", false)) flags = (MessageFlag)(flags | MessageFlagSeen);
+    if (remote.value("isDraft", false)) flags = (MessageFlag)(flags | MessageFlagDraft);
+    if (remote.count("flag") && remote["flag"].value("flagStatus", "") == "flagged") {
+        flags = (MessageFlag)(flags | MessageFlagFlagged);
+    }
+    message->setFlags(flags);
+
+    MessageHeader * header = message->header();
+    string messageId = remote.value("internetMessageId", "");
+    if (messageId.empty()) messageId = "graph-" + graphId;
+    header->setMessageID(AS_MCSTR(messageId));
+    header->setSubject(AS_MCSTR(remote.value("subject", "No Subject")));
+    time_t received = graphDate(remote.value("receivedDateTime", ""));
+    header->setDate(received);
+    header->setReceivedDate(received);
+    if (remote.count("from")) header->setFrom(graphAddress(remote["from"]));
+    header->setTo(graphAddresses(remote.value("toRecipients", json::array())));
+    header->setCc(graphAddresses(remote.value("ccRecipients", json::array())));
+    header->setBcc(graphAddresses(remote.value("bccRecipients", json::array())));
+    header->setReplyTo(graphAddresses(remote.value("replyTo", json::array())));
+    return message;
+}
+
 
 SyncWorker::SyncWorker(shared_ptr<Account> account) :
     store(new MailStore()),
@@ -67,6 +150,7 @@ SyncWorker::SyncWorker(shared_ptr<Account> account) :
 
 void SyncWorker::configure()
 {
+    if (account->usesMicrosoftGraph()) return;
     // For accounts connecting with XOAuth2, this function may
     // make HTTP requests so it's important this function is called
     // within the thread retry handlers.
@@ -93,6 +177,25 @@ void SyncWorker::idleQueueBodiesToSync(vector<string> & ids) {
 
 void SyncWorker::idleCycleIteration()
 {
+    if (account->usesMicrosoftGraph()) {
+        while (true) {
+            string id;
+            {
+                std::unique_lock<std::mutex> lck(idleMtx);
+                if (idleFetchBodyIDs.empty()) break;
+                id = idleFetchBodyIDs.back();
+                idleFetchBodyIDs.pop_back();
+            }
+            auto message = store->find<Message>(Query().equal("id", id));
+            if (message) syncMicrosoftGraphMessageBody(message.get());
+        }
+        TaskProcessor taskProcessor { account, store, nullptr };
+        taskProcessor.cleanupOldTasksAtRuntime();
+        auto tasks = store->findAll<Task>(Query().equal("accountId", account->id()).equal("status", "remote"));
+        for (auto & task : tasks) taskProcessor.performRemote(task.get());
+        MailUtils::sleepWorkerUntilWakeOrSec(30);
+        return;
+    }
     // Run body requests from the client
     while (true) {
         string id;
@@ -297,6 +400,7 @@ void SyncWorker::markAllFoldersBusy() {
 bool SyncWorker::syncNow()
 {
     AutoreleasePool pool;
+    if (account->usesMicrosoftGraph()) return syncMicrosoftGraphMessages();
     bool syncAgainImmediately = false;
 
     vector<shared_ptr<Folder>> folders = syncFoldersAndLabels();
@@ -555,10 +659,152 @@ void SyncWorker::ensureRootMailspringFolder(vector<string> containerFolderCompon
     }
 }
 
+vector<shared_ptr<Folder>> SyncWorker::syncMicrosoftGraphFolders()
+{
+    logger->info("Syncing Microsoft Graph folder list...");
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    const vector<pair<string, string>> knownFolders = {
+        {"inbox", "inbox"}, {"archive", "archive"}, {"drafts", "drafts"},
+        {"sentitems", "sent"}, {"deleteditems", "trash"}, {"junkemail", "spam"}
+    };
+
+    map<string, string> rolesByGraphId;
+    for (const auto & known : knownFolders) {
+        string url = MicrosoftGraphBaseURL(account) + "/mailFolders/" + known.first +
+            "?$select=id";
+        json remote = PerformJSONRequest(CreateMicrosoftGraphRequest(url, "GET", token));
+        string graphId = remote.value("id", "");
+        if (!graphId.empty()) rolesByGraphId[graphId] = known.second;
+    }
+
+    vector<shared_ptr<Folder>> folders;
+    vector<pair<string, string>> pages = {{
+        MicrosoftGraphBaseURL(account) + "/mailFolders?$top=100&includeHiddenFolders=true&$select=id,displayName,totalItemCount,unreadItemCount,parentFolderId,childFolderCount",
+        ""
+    }};
+    for (size_t pageIndex = 0; pageIndex < pages.size(); pageIndex++) {
+        json response = PerformJSONRequest(CreateMicrosoftGraphRequest(pages[pageIndex].first, "GET", token));
+        if (!response.count("value") || !response["value"].is_array()) continue;
+        MailStoreTransaction transaction(store, "syncMicrosoftGraphFolders");
+        for (const auto & remote : response["value"]) {
+            string graphId = remote.value("id", "");
+            if (graphId.empty()) continue;
+            string displayName = remote.value("displayName", "Folder");
+            string path = pages[pageIndex].second.empty()
+                ? displayName : pages[pageIndex].second + "/" + displayName;
+            string localId = MailUtils::idForFolder(account->id(), "graph:" + graphId);
+            auto local = store->find<Folder>(Query().equal("id", localId));
+            if (!local) local = make_shared<Folder>(localId, account->id(), 0);
+            local->setPath(path);
+            local->setRole(rolesByGraphId.count(graphId) ? rolesByGraphId[graphId] : "");
+            local->localStatus()["graphId"] = graphId;
+            local->localStatus()["graphParentId"] = remote.value("parentFolderId", "");
+            local->localStatus()["total"] = remote.value("totalItemCount", 0);
+            local->localStatus()["unread"] = remote.value("unreadItemCount", 0);
+            local->localStatus()[LS_BUSY] = false;
+            store->save(local.get());
+            folders.push_back(local);
+
+            if (remote.value("childFolderCount", 0) > 0) {
+                pages.push_back({
+                    MicrosoftGraphBaseURL(account) + "/mailFolders/" + graphUrlEncode(graphId) +
+                        "/childFolders?$top=100&includeHiddenFolders=true&$select=id,displayName,totalItemCount,unreadItemCount,parentFolderId,childFolderCount",
+                    path
+                });
+            }
+        }
+        transaction.commit();
+        if (response.count("@odata.nextLink") && response["@odata.nextLink"].is_string()) {
+            pages.push_back({response["@odata.nextLink"].get<string>(), pages[pageIndex].second});
+        }
+    }
+    return folders;
+}
+
+bool SyncWorker::syncMicrosoftGraphMessages()
+{
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    auto folders = store->findAll<Folder>(Query().equal("accountId", account->id()));
+    bool hasMoreInitialPages = false;
+
+    for (auto & folder : folders) {
+        json & status = folder->localStatus();
+        if (!status.count("graphId") || !status["graphId"].is_string()) continue;
+
+        string url;
+        if (status.count("graphNextLink") && status["graphNextLink"].is_string() &&
+            !status["graphNextLink"].get<string>().empty()) {
+            url = status["graphNextLink"].get<string>();
+        } else if (status.count("graphDeltaLink") && status["graphDeltaLink"].is_string() &&
+                   !status["graphDeltaLink"].get<string>().empty()) {
+            url = status["graphDeltaLink"].get<string>();
+        } else {
+            url = MicrosoftGraphBaseURL(account) + "/mailFolders/" +
+                graphUrlEncode(status["graphId"].get<string>()) +
+                "/messages/delta?$top=100&$select=id,internetMessageId,conversationId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,isRead,flag,bodyPreview,hasAttachments,isDraft,parentFolderId";
+        }
+
+        json response = PerformJSONRequest(CreateMicrosoftGraphRequest(url, "GET", token));
+        if (!response.count("value") || !response["value"].is_array()) continue;
+
+        MailStoreTransaction transaction(store, "syncMicrosoftGraphMessages");
+        for (const auto & remote : response["value"]) {
+            string graphId = remote.value("id", "");
+            if (graphId.empty()) continue;
+            if (remote.count("@removed")) {
+                auto localMessages = store->findAll<Message>(Query().equal("accountId", account->id()).equal("remoteFolderId", folder->id()));
+                for (auto & local : localMessages) {
+                    if (local->graphId() == graphId) {
+                        store->remove(local.get());
+                        break;
+                    }
+                }
+                continue;
+            }
+            IMAPMessage * graph = graphMessage(remote);
+            auto local = processor->insertFallbackToUpdateMessage(graph, *folder, time(0));
+            local->setGraphId(graphId);
+            local->setSnippet(remote.value("bodyPreview", ""));
+            local->setSyncedAt(time(0));
+            store->save(local.get());
+            graph->release();
+        }
+
+        if (response.count("@odata.nextLink") && response["@odata.nextLink"].is_string()) {
+            status["graphNextLink"] = response["@odata.nextLink"];
+            hasMoreInitialPages = true;
+        } else {
+            status["graphNextLink"] = "";
+            if (response.count("@odata.deltaLink") && response["@odata.deltaLink"].is_string()) {
+                status["graphDeltaLink"] = response["@odata.deltaLink"];
+            }
+        }
+        store->save(folder.get());
+        transaction.commit();
+    }
+    return hasMoreInitialPages;
+}
+
+void SyncWorker::syncMicrosoftGraphMessageBody(Message * message)
+{
+    string graphId = message->graphId();
+    if (graphId.empty()) return;
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    string url = MicrosoftGraphBaseURL(account) + "/messages/" + graphUrlEncode(graphId) + "/$value";
+    CURL * request = CreateMicrosoftGraphRequest(url, "GET", token);
+    string raw = PerformRequest(request);
+    CleanupCurlRequest(request);
+    Data * data = Data::dataWithBytes(raw.c_str(), (unsigned int)raw.size());
+    MessageParser * parser = MessageParser::messageParserWithData(data);
+    if (!parser) throw SyncException("invalid-graph-message", "Microsoft Graph returned invalid MIME content.", true);
+    processor->retrievedMessageBody(message, parser);
+}
+
 vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
 {
     // allocated mailcore objects freed when `pool` is removed from the stack
     AutoreleasePool pool;
+    if (account->usesMicrosoftGraph()) return syncMicrosoftGraphFolders();
 
     string containerFolderPath = account->containerFolder();
     vector<string> containerFolderComponents;

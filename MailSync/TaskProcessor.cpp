@@ -27,6 +27,7 @@
 #include "ProgressCollectors.hpp"
 #include "SyncException.hpp"
 #include "NetworkRequestUtils.hpp"
+#include "XOAuth2TokenManager.hpp"
 
 #include <sstream>
 #include <algorithm>
@@ -45,6 +46,28 @@
 #endif
 
 using namespace std;
+
+static string taskGraphUrlEncode(const string & value) {
+    CURL *curl = curl_easy_init();
+    char *encoded = curl_easy_escape(curl, value.c_str(), (int)value.size());
+    string result = encoded ? encoded : "";
+    if (encoded) curl_free(encoded);
+    curl_easy_cleanup(curl);
+    return result;
+}
+
+static Data * fetchMicrosoftGraphMIME(shared_ptr<Account> account, Message * message) {
+    if (message->graphId().empty()) {
+        throw SyncException("not-found", "Microsoft Graph message ID is unavailable.", false);
+    }
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    string url = MicrosoftGraphBaseURL(account) + "/messages/" +
+        taskGraphUrlEncode(message->graphId()) + "/$value";
+    CURL * request = CreateMicrosoftGraphRequest(url, "GET", token);
+    string raw = PerformRequest(request);
+    CleanupCurlRequest(request);
+    return Data::dataWithBytes(raw.c_str(), (unsigned int)raw.size());
+}
 using namespace mailcore;
 using namespace nlohmann;
 
@@ -520,13 +543,16 @@ void TaskProcessor::performRemote(Task * task) {
             task->setStatus("cancelled");
         } else {
             if (cname == "ChangeUnreadTask") {
-                performRemoteChangeOnMessages(task, false, _applyUnreadInIMAPFolder);
+                if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
+                else performRemoteChangeOnMessages(task, false, _applyUnreadInIMAPFolder);
                 
             } else if (cname == "ChangeStarredTask") {
-                performRemoteChangeOnMessages(task, false, _applyStarredInIMAPFolder);
+                if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
+                else performRemoteChangeOnMessages(task, false, _applyStarredInIMAPFolder);
                 
             } else if (cname == "ChangeFolderTask") {
-                performRemoteChangeOnMessages(task, true, _applyFolderMoveInIMAPFolder);
+                if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
+                else performRemoteChangeOnMessages(task, true, _applyFolderMoveInIMAPFolder);
 
             } else if (cname == "ChangeLabelsTask") {
                 performRemoteChangeOnMessages(task, false, _applyLabelChangeInIMAPFolder);
@@ -839,6 +865,55 @@ void TaskProcessor::performRemoteChangeOnMessages(Task * task, bool updatesFolde
     }
 }
 
+void TaskProcessor::performRemoteMicrosoftGraphChange(Task * task) {
+    json & data = task->data();
+    string cname = task->constructorName();
+    auto messages = inflateMessages(data).messages;
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    shared_ptr<Folder> destination = nullptr;
+    if (cname == "ChangeFolderTask") {
+        destination = store->find<Folder>(Query().equal("id", data["folder"]["id"].get<string>()));
+        if (!destination || !destination->localStatus().count("graphId")) {
+            throw SyncException("invalid-graph-folder", "The Microsoft Graph destination folder is unavailable.", false);
+        }
+    }
+
+    map<string, string> movedGraphIds;
+    for (auto & message : messages) {
+        if (message->graphId().empty()) continue;
+        string url = MicrosoftGraphBaseURL(account) + "/messages/" + taskGraphUrlEncode(message->graphId());
+        json payload;
+        string method = "PATCH";
+        if (cname == "ChangeUnreadTask") {
+            payload = {{"isRead", !data["unread"].get<bool>()}};
+        } else if (cname == "ChangeStarredTask") {
+            payload = {{"flag", {{"flagStatus", data["starred"].get<bool>() ? "flagged" : "notFlagged"}}}};
+        } else if (cname == "ChangeFolderTask") {
+            method = "POST";
+            url += "/move";
+            payload = {{"destinationId", destination->localStatus()["graphId"]}};
+        }
+        string serialized = payload.dump();
+        json response = PerformJSONRequest(CreateMicrosoftGraphRequest(url, method, token, serialized.c_str()));
+        if (cname == "ChangeFolderTask" && response.count("id")) {
+            movedGraphIds[message->id()] = response["id"].get<string>();
+        }
+    }
+
+    MailStoreTransaction transaction{store, "performRemoteMicrosoftGraphChange"};
+    auto safeMessages = inflateMessages(data).messages;
+    for (auto & safe : safeMessages) {
+        if (destination) safe->setRemoteFolder(destination.get());
+        if (movedGraphIds.count(safe->id())) safe->setGraphId(movedGraphIds[safe->id()]);
+        int remaining = max(0, safe->syncUnsavedChanges() - 1);
+        safe->setSyncUnsavedChanges(remaining);
+        if (remaining == 0) safe->setSyncedAt(time(0));
+        store->save(safe.get());
+    }
+    store->unsafeEraseTransactionDeltas();
+    transaction.commit();
+}
+
 void TaskProcessor::performLocalSaveDraft(Task * task) {
     json & draftJSON = task->data()["draft"];
     
@@ -923,6 +998,15 @@ void TaskProcessor::performRemoteDestroyDraft(Task * task) {
     for (auto & stub : stubs) {
         if (stub->remoteUID() == 0) {
             continue; // not synced to server at all
+        }
+        if (account->usesMicrosoftGraph()) {
+            if (!stub->graphId().empty()) {
+                auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+                string url = MicrosoftGraphBaseURL(account) + "/messages/" + taskGraphUrlEncode(stub->graphId());
+                PerformJSONRequest(CreateMicrosoftGraphRequest(url, "DELETE", token));
+            }
+            store->remove(stub.get());
+            continue;
         }
         auto uids = IndexSet::indexSetWithIndex(stub->remoteUID());
         String * path = AS_MCSTR(stub->remoteFolder()["path"].get<string>());
@@ -1312,6 +1396,44 @@ void TaskProcessor::performRemoteSyncbackCategory(Task * task) {
     string path = data["path"].get<string>();
     string existingPath = data.count("existingPath") ? data["existingPath"].get<string>() : "";
 
+    if (account->usesMicrosoftGraph()) {
+        auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+        string displayName = path.substr(path.find_last_of('/') == string::npos ? 0 : path.find_last_of('/') + 1);
+        json payload = {{"displayName", displayName}};
+        string serialized = payload.dump();
+        json remote;
+        shared_ptr<Folder> localModel = nullptr;
+        if (!existingPath.empty()) {
+            localModel = store->find<Folder>(Query().equal("accountId", accountId).equal("path", existingPath));
+            if (!localModel || !localModel->localStatus().count("graphId")) {
+                throw SyncException("invalid-graph-folder", "The Microsoft Graph folder to rename was not found.", false);
+            }
+            string url = MicrosoftGraphBaseURL(account) + "/mailFolders/" +
+                taskGraphUrlEncode(localModel->localStatus()["graphId"].get<string>());
+            remote = PerformJSONRequest(CreateMicrosoftGraphRequest(url, "PATCH", token, serialized.c_str()));
+        } else {
+            string parentPath = path.find_last_of('/') == string::npos ? "" : path.substr(0, path.find_last_of('/'));
+            string url = MicrosoftGraphBaseURL(account) + "/mailFolders";
+            if (!parentPath.empty()) {
+                auto parent = store->find<Folder>(Query().equal("accountId", accountId).equal("path", parentPath));
+                if (!parent || !parent->localStatus().count("graphId")) {
+                    throw SyncException("invalid-graph-folder", "The Microsoft Graph parent folder was not found.", false);
+                }
+                url += "/" + taskGraphUrlEncode(parent->localStatus()["graphId"].get<string>()) + "/childFolders";
+            }
+            remote = PerformJSONRequest(CreateMicrosoftGraphRequest(url, "POST", token, serialized.c_str()));
+            string graphId = remote.value("id", "");
+            if (graphId.empty()) throw SyncException("invalid-graph-folder", "Microsoft Graph did not return the created folder.", false);
+            localModel = make_shared<Folder>(MailUtils::idForFolder(accountId, "graph:" + graphId), accountId, 0);
+            localModel->localStatus()["graphId"] = graphId;
+        }
+        localModel->setPath(path);
+        localModel->setRole("");
+        data["created"] = localModel->toJSON();
+        store->save(localModel.get());
+        return;
+    }
+
     // if the requested path includes "/" delimiters, replace them with the real delimiter
     char delimiter = session->defaultNamespace()->mainDelimiter();
     std::replace(path.begin(), path.end(), '/', delimiter);
@@ -1416,6 +1538,15 @@ void TaskProcessor::performRemoteDestroyCategory(Task * task) {
     json & data = task->data();
     string accountId = task->accountId();
     string path = data["path"].get<string>();
+    if (account->usesMicrosoftGraph()) {
+        auto folder = store->find<Folder>(Query().equal("accountId", accountId).equal("path", path));
+        if (!folder || !folder->localStatus().count("graphId")) return;
+        auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+        string url = MicrosoftGraphBaseURL(account) + "/mailFolders/" +
+            taskGraphUrlEncode(folder->localStatus()["graphId"].get<string>());
+        PerformJSONRequest(CreateMicrosoftGraphRequest(url, "DELETE", token));
+        return;
+    }
     ErrorCode err = ErrorCode::ErrorNone;
     
     session->deleteFolder(AS_MCSTR(path), &err);
@@ -1565,6 +1696,21 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
 
     // Save the message data / body we'll write to the sent folder
     Data * messageDataForSent = builder.data();
+
+    if (account->usesMicrosoftGraph()) {
+        if (multisend) {
+            throw SyncException("graph-multisend-unsupported", "Per-recipient multisend is not yet supported for Microsoft Graph accounts.", false);
+        }
+        auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+        string mime((const char *)messageDataForSent->bytes(), messageDataForSent->length());
+        string encoded = MailUtils::toBase64(mime.c_str(), mime.size());
+        CURL * request = CreateMicrosoftGraphMimeRequest(
+            MicrosoftGraphBaseURL(account) + "/sendMail", token, encoded);
+        PerformRequest(request);
+        CleanupCurlRequest(request);
+        if (existing) store->remove(existing.get());
+        return;
+    }
 
     /*
     OK! If we've reached this point we're going to deliver the message. To do multisend,
@@ -1866,6 +2012,19 @@ void TaskProcessor::performRemoteExpungeAllInFolder(Task * task) {
     const auto path = task->data()["folder"]["path"].get<string>();
     const auto id = task->data()["folder"]["id"].get<string>();
 
+    if (account->usesMicrosoftGraph()) {
+        auto messages = store->findAll<Message>(Query().equal("accountId", task->accountId()).equal("remoteFolderId", id));
+        auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+        for (auto & message : messages) {
+            if (!message->graphId().empty()) {
+                string url = MicrosoftGraphBaseURL(account) + "/messages/" + taskGraphUrlEncode(message->graphId());
+                PerformJSONRequest(CreateMicrosoftGraphRequest(url, "DELETE", token));
+            }
+            store->remove(message.get());
+        }
+        return;
+    }
+
     IndexSet set;
     set.addRange(RangeMake(1, UINT64_MAX));
     session->storeFlagsByUID(AS_MCSTR(path), &set, IMAPStoreFlagsRequestKindAdd, MessageFlagDeleted, &err);
@@ -1907,7 +2066,9 @@ void TaskProcessor::performRemoteGetMessageRFC2822(Task * task) {
         throw SyncException("not-found", "Message not found for RFC2822 fetch", false);
     }
 
-    Data * data = session->fetchMessageByUID(AS_MCSTR(msg->remoteFolder()["path"].get<string>()), msg->remoteUID(), &cb, &err);
+    Data * data = account->usesMicrosoftGraph()
+        ? fetchMicrosoftGraphMIME(account, msg.get())
+        : session->fetchMessageByUID(AS_MCSTR(msg->remoteFolder()["path"].get<string>()), msg->remoteUID(), &cb, &err);
     if (err != ErrorNone) {
         logger->error("Unable to fetch rfc2822 for message (UID {}). Error {}", msg->remoteUID(), ErrorCodeToTypeMap[err]);
         throw SyncException(err, "performRemoteGetMessageRFC2822");
@@ -2062,8 +2223,9 @@ void TaskProcessor::performRemoteGetManyRFC2822(Task * task) {
             ErrorCode err = ErrorNone;
 
             try {
-                Data * data = session->fetchMessageByUID(
-                    AS_MCSTR(folderPath), msg->remoteUID(), &cb, &err);
+                Data * data = account->usesMicrosoftGraph()
+                    ? fetchMicrosoftGraphMIME(account, msg.get())
+                    : session->fetchMessageByUID(AS_MCSTR(folderPath), msg->remoteUID(), &cb, &err);
 
                 if (err != ErrorNone) {
                     throw SyncException(err, "GetManyRFC2822 fetch");

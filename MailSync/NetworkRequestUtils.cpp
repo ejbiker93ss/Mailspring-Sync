@@ -56,7 +56,7 @@ size_t _onAppendToString(void *contents, size_t length, size_t nmemb, void *user
     return real_size;
 }
 
-const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken) {
+const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken, bool useMicrosoftGraph) {
     CURL * curl_handle = curl_easy_init();
     const char * url =
           provider == "gmail" ? "https://www.googleapis.com/oauth2/v4/token"
@@ -72,7 +72,9 @@ const json MakeOAuthRefreshRequest(string provider, string clientId, string refr
     curl_free(c);
     curl_free(r);
 
-    if (provider == "office365" || provider == "outlook") {
+    if (useMicrosoftGraph) {
+        payload += "&scope=https%3A%2F%2Fgraph.microsoft.com%2FMail.ReadWrite%20https%3A%2F%2Fgraph.microsoft.com%2FMail.ReadWrite.Shared%20https%3A%2F%2Fgraph.microsoft.com%2FMail.Send%20https%3A%2F%2Fgraph.microsoft.com%2FMail.Send.Shared%20https%3A%2F%2Fgraph.microsoft.com%2FUser.Read%20offline_access";
+    } else if (provider == "office365" || provider == "outlook") {
         // workaround the fact that Microsoft's OAUTH flow allows you to authorize many scopes, but you
         // have to get a separate token for outlook (email + IMAP) and contacts / calendar / Microsoft Graph APIs
         // separately. The same refresh token will give you access tokens, but the access tokens are different.
@@ -124,6 +126,42 @@ CURL * CreateJSONRequest(string url, string method, string authorization, const 
     curl_easy_setopt(curl_handle, CURLOPT_PRIVATE, requestData);
 
     return curl_handle;
+}
+
+CURL * CreateMicrosoftGraphRequest(string url, string method, string accessToken, const char * payloadChars) {
+    CURL * request = CreateJSONRequest(url, method, "Bearer " + accessToken, payloadChars);
+    CurlRequestData *data = nullptr;
+    curl_easy_getinfo(request, CURLINFO_PRIVATE, &data);
+    if (data != nullptr) {
+        data->headers = curl_slist_append(data->headers, "Prefer: IdType=\"ImmutableId\"");
+        curl_easy_setopt(request, CURLOPT_HTTPHEADER, data->headers);
+    }
+    return request;
+}
+
+CURL * CreateMicrosoftGraphMimeRequest(string url, string accessToken, const string & base64Mime) {
+    CURL * request = CreateJSONRequest(url, "POST", "Bearer " + accessToken, nullptr);
+    CurlRequestData *data = nullptr;
+    curl_easy_getinfo(request, CURLINFO_PRIVATE, &data);
+    if (data != nullptr) {
+        data->headers = curl_slist_append(data->headers, "Content-Type: text/plain");
+        data->headers = curl_slist_append(data->headers, "Prefer: IdType=\"ImmutableId\"");
+        curl_easy_setopt(request, CURLOPT_HTTPHEADER, data->headers);
+    }
+    curl_easy_setopt(request, CURLOPT_POSTFIELDS, base64Mime.c_str());
+    curl_easy_setopt(request, CURLOPT_POSTFIELDSIZE, (long)base64Mime.size());
+    return request;
+}
+
+string MicrosoftGraphBaseURL(shared_ptr<Account> account) {
+    string mailbox = account->graphMailbox();
+    if (mailbox.empty()) return "https://graph.microsoft.com/v1.0/me";
+    CURL *curl = curl_easy_init();
+    char *encoded = curl_easy_escape(curl, mailbox.c_str(), (int)mailbox.size());
+    string result = "https://graph.microsoft.com/v1.0/users/" + string(encoded ? encoded : "");
+    if (encoded) curl_free(encoded);
+    curl_easy_cleanup(curl);
+    return result;
 }
 
 const string PerformRequest(CURL * curl_handle) {

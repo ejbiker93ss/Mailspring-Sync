@@ -72,6 +72,18 @@ string Account::provider() {
     return _data["provider"].get<string>();
 }
 
+bool Account::usesMicrosoftGraph() {
+    json & s = _data["settings"];
+    return s.count("sync_engine") && s["sync_engine"].is_string() &&
+           s["sync_engine"].get<string>() == "microsoft_graph";
+}
+
+string Account::graphMailbox() {
+    json & s = _data["settings"];
+    return s.count("graph_mailbox") && s["graph_mailbox"].is_string()
+        ? s["graph_mailbox"].get<string>() : "";
+}
+
 string Account::emailAddress() {
     return _data["emailAddress"].get<string>();
 }
@@ -123,6 +135,13 @@ bool Account::IMAPAllowInsecureSSL() {
 
 string Account::CalDAVHost() {
     json & s = _data["settings"];
+
+    if (usesMicrosoftGraph()) {
+        if (!(s.count("refresh_token") && s.count("refresh_client_id"))) {
+            return "Microsoft Graph OAuth configuration";
+        }
+        return "";
+    }
     return s.count("caldav_host") ? s["caldav_host"].get<string>() : "";
 }
 

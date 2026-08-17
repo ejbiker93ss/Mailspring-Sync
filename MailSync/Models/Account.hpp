@@ -41,6 +41,8 @@ public:
     string refreshClientId();
     string provider();
     string emailAddress();
+    bool usesMicrosoftGraph();
+    string graphMailbox();
 
     unsigned int IMAPPort();
     string IMAPHost();

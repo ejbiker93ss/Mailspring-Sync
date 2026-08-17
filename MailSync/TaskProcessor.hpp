@@ -57,6 +57,7 @@ private:
 
     void performLocalChangeOnMessages(Task * task,  void (*modifyLocalMessage)(Message *, json &));
     void performRemoteChangeOnMessages(Task * task, bool updatesFolder, void (*applyInFolder)(IMAPSession * session, String * path, IndexSet * uids, vector<shared_ptr<Message>> messages, json & data));
+    void performRemoteMicrosoftGraphChange(Task * task);
     void performLocalSaveDraft(Task * task);
     void performLocalDestroyDraft(Task * task);
     void performRemoteDestroyDraft(Task * task);

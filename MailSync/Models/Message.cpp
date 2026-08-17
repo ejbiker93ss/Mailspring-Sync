@@ -339,6 +339,15 @@ void Message::setRemoteUID(uint32_t v) {
     _data["remoteUID"] = v;
 }
 
+string Message::graphId() {
+    return _data.count("graphId") && _data["graphId"].is_string()
+        ? _data["graphId"].get<string>() : "";
+}
+
+void Message::setGraphId(string id) {
+    _data["graphId"] = id;
+}
+
 json Message::clientFolder() {
     return _data["folder"];
 }

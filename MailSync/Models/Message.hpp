@@ -116,6 +116,9 @@ public:
 
     uint32_t remoteUID();
     void setRemoteUID(uint32_t v);
+
+    string graphId();
+    void setGraphId(string id);
     
     json clientFolder();
     string clientFolderId();

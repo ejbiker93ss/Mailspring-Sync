@@ -42,6 +42,7 @@
 #include "Task.hpp"
 #include "TaskProcessor.hpp"
 #include "NetworkRequestUtils.hpp"
+#include "XOAuth2TokenManager.hpp"
 #include "ThreadUtils.h"
 #include "constants.h"
 #include "SPDLogExtensions.hpp"
@@ -284,6 +285,36 @@ int runTestAuth(shared_ptr<Account> account) {
     // Enable very detailed mailcore logging and redirect the messages to our accumulator log
     MCLogEnabled = 1;
     MCLogFn = MCLogToAccumulatorLog;
+
+    if (account->usesMicrosoftGraph()) {
+        json resp = {
+            {"error", nullptr},
+            {"error_service", "microsoft graph"},
+            {"log", "----------MICROSOFT GRAPH----------\n"},
+            {"account", nullptr}
+        };
+        try {
+            auto parts = SharedXOAuth2TokenManager()->partsForAccount(account);
+            auto request = CreateJSONRequest(
+                MicrosoftGraphBaseURL(account) + "/mailFolders/inbox?$select=id,displayName",
+                "GET",
+                "Bearer " + parts.accessToken
+            );
+            auto inbox = PerformJSONRequest(request);
+            if (!inbox.count("id")) {
+                throw SyncException("invalid-graph-mailbox", "Microsoft Graph did not return an Inbox folder.", false);
+            }
+            resp["account"] = account->toJSON();
+            resp["log"] = "Microsoft Graph mailbox validation succeeded. No IMAP or SMTP connection was attempted.\n";
+            cout << resp.dump();
+            return 0;
+        } catch (std::exception & ex) {
+            resp["error"] = "ErrorAuthentication";
+            resp["log"] = string("Microsoft Graph mailbox validation failed: ") + ex.what();
+            cout << resp.dump();
+            return 1;
+        }
+    }
 
     // NOTE: This method returns the account upon success but the client is not
     // reading the result. This function cannot mutate the account object.

@@ -55,7 +55,7 @@ XOAuth2Parts XOAuth2TokenManager::partsForAccount(shared_ptr<Account> account) {
     json updated {};
     if (refreshClientId != "") {
         spdlog::get("logger")->info("Fetching XOAuth2 access token ({}) for {}", account->provider(), account->id());
-        updated = MakeOAuthRefreshRequest(account->provider(), refreshClientId, account->refreshToken());
+        updated = MakeOAuthRefreshRequest(account->provider(), refreshClientId, account->refreshToken(), account->usesMicrosoftGraph());
         updated["expiry_date"] = time(0) + updated["expires_in"].get<int>();
     } else {
         throw SyncException("invalid-xoauth2-resp", "XOAuth2 token expired and Mailspring no longer does server-side token refresh.", false);

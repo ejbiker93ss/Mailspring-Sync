@@ -69,6 +69,10 @@ public:
     std::vector<std::shared_ptr<Folder>> syncFoldersAndLabels();
 
 private:
+
+    vector<shared_ptr<Folder>> syncMicrosoftGraphFolders();
+    bool syncMicrosoftGraphMessages();
+    void syncMicrosoftGraphMessageBody(Message * message);
     
     void ensureRootMailspringFolder(vector<string> containerFolderComponents, Array * remoteFolders);
 

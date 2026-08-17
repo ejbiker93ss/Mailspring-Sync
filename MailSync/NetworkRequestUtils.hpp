@@ -14,6 +14,7 @@
 
 #include <curl/curl.h>
 #include <stdio.h>
+#include <memory>
 #include "json.hpp"
 
 class Account;
@@ -27,9 +28,12 @@ size_t _onAppendToString(void *contents, size_t length, size_t nmemb, void *user
 void CleanupCurlRequest(CURL * curl_handle);
 
 CURL * CreateJSONRequest(string url, string method = "GET", string authorization = "", const char * payloadChars = nullptr);
+CURL * CreateMicrosoftGraphRequest(string url, string method, string accessToken, const char * payloadChars = nullptr);
+CURL * CreateMicrosoftGraphMimeRequest(string url, string accessToken, const string & base64Mime);
+string MicrosoftGraphBaseURL(shared_ptr<Account> account);
 CURL * CreateCalDavRequest(string url, string method = "GET", const char * payloadChars = nullptr);
 
-const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken);
+const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken, bool useMicrosoftGraph = false);
 
 const string PerformRequest(CURL * curl_handle);
 const json PerformJSONRequest(CURL * curl_handle);
