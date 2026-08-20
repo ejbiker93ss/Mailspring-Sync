@@ -747,7 +747,10 @@ bool SyncWorker::syncMicrosoftGraphMessages()
         json response = PerformJSONRequest(CreateMicrosoftGraphRequest(url, "GET", token));
         if (!response.count("value") || !response["value"].is_array()) continue;
 
-        MailStoreTransaction transaction(store, "syncMicrosoftGraphMessages");
+        // MailProcessor owns the transaction for each insert/update. Do not wrap
+        // the Graph page in another transaction: SQLite does not support nested
+        // BEGIN statements, and insertFallbackToUpdateMessage() deliberately
+        // starts its own transaction to keep thread/message updates atomic.
         for (const auto & remote : response["value"]) {
             string graphId = remote.value("id", "");
             if (graphId.empty()) continue;
@@ -780,7 +783,6 @@ bool SyncWorker::syncMicrosoftGraphMessages()
             }
         }
         store->save(folder.get());
-        transaction.commit();
     }
     return hasMoreInitialPages;
 }
