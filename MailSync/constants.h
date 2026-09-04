@@ -112,6 +112,7 @@ static vector<string> V1_SETUP_QUERIES = {
     "CREATE INDEX IF NOT EXISTS ThreadGmailLookup ON `Thread` (gThrId) WHERE gThrId IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS ThreadIsSearchIndexedIndex ON `Thread` (isSearchIndexed, id)",
     "CREATE INDEX IF NOT EXISTS ThreadIsSearchIndexedLastMessageReceivedIndex ON `Thread` (isSearchIndexed, lastMessageReceivedTimestamp)",
+    "CREATE INDEX IF NOT EXISTS ThreadAccountSearchDateIndex ON `Thread` (accountId, lastMessageReceivedTimestamp DESC, id)",
 
     "CREATE TABLE IF NOT EXISTS ThreadReference ("
         "threadId VARCHAR(42),"
@@ -224,6 +225,11 @@ static vector<string> V8_SETUP_QUERIES = {
 static vector<string> V9_SETUP_QUERIES = {
     "ALTER TABLE `Event` ADD COLUMN recurrenceId VARCHAR(50) DEFAULT ''",
     "CREATE INDEX IF NOT EXISTS EventRecurrenceId ON Event(calendarId, icsuid, recurrenceId)",
+};
+
+// V10: Support account-scoped FTS result joins and date ordering without a full thread scan.
+static vector<string> V10_SETUP_QUERIES = {
+    "CREATE INDEX IF NOT EXISTS ThreadAccountSearchDateIndex ON `Thread` (accountId, lastMessageReceivedTimestamp DESC, id)",
 };
 
 static map<string, string> COMMON_FOLDER_NAMES = {
