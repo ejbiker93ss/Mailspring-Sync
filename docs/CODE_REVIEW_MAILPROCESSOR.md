@@ -2,7 +2,7 @@
 
 ## Overview
 
-`MailProcessor` is responsible for parsing IMAP messages and creating database models. It handles the conversion from MailCore2 IMAP structures to Mailspring's Message, Thread, Contact, and File models.
+`MailProcessor` is responsible for parsing IMAP messages and creating database models. It handles the conversion from MailCore2 IMAP structures to SummerMail's Message, Thread, Contact, and File models.
 
 ### Key Responsibilities
 

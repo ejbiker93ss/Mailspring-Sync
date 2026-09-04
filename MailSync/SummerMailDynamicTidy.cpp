@@ -1,6 +1,6 @@
 //
-//  MailspringDynamicTidy.cpp
-//  Mailspring-Sync
+//  SummerMailDynamicTidy.cpp
+//  SummerMail-Sync
 //
 //  Dynamic loading wrapper for libtidy on Linux.
 //  This allows the same binary to work across different Linux distributions
@@ -8,7 +8,7 @@
 //  Fedora: libtidy.so.5, etc.)
 //
 
-#include "MailspringDynamicTidy.h"
+#include "SummerMailDynamicTidy.h"
 
 #if defined(__linux__)
 
@@ -55,7 +55,7 @@ static unsigned int s_optForceOutput = 0;
 static unsigned int s_optShowWarnings = 0;
 static unsigned int s_optShowErrors = 0;
 
-void mailspring_tidy_init(void) {
+void summermail_tidy_init(void) {
     if (s_tidyLib != nullptr) {
         return; // Already initialized
     }
@@ -154,14 +154,14 @@ void mailspring_tidy_init(void) {
 // GCC/Clang constructor attribute: runs automatically at program startup
 __attribute__((constructor))
 static void initTidyLibrary() {
-    mailspring_tidy_init();
+    summermail_tidy_init();
 }
 
-int mailspring_tidy_available(void) {
+int summermail_tidy_available(void) {
     return s_tidyLib != nullptr;
 }
 
-const char* mailspring_tidy_error(void) {
+const char* summermail_tidy_error(void) {
     if (s_tidyLib != nullptr) {
         return nullptr; // No error, tidy is available
     }
@@ -169,60 +169,60 @@ const char* mailspring_tidy_error(void) {
 }
 
 // Wrapper implementations
-MSTidyDoc mailspring_tidyCreate(void) {
+MSTidyDoc summermail_tidyCreate(void) {
     return s_tidyCreate ? s_tidyCreate() : nullptr;
 }
 
-void mailspring_tidyRelease(MSTidyDoc tdoc) {
+void summermail_tidyRelease(MSTidyDoc tdoc) {
     if (s_tidyRelease) s_tidyRelease(tdoc);
 }
 
-void mailspring_tidyBufInit(MSTidyBuffer* buf) {
+void summermail_tidyBufInit(MSTidyBuffer* buf) {
     if (s_tidyBufInit) s_tidyBufInit(buf);
 }
 
-void mailspring_tidyBufFree(MSTidyBuffer* buf) {
+void summermail_tidyBufFree(MSTidyBuffer* buf) {
     if (s_tidyBufFree) s_tidyBufFree(buf);
 }
 
-void mailspring_tidyBufAppend(MSTidyBuffer* buf, void* data, unsigned int size) {
+void summermail_tidyBufAppend(MSTidyBuffer* buf, void* data, unsigned int size) {
     if (s_tidyBufAppend) s_tidyBufAppend(buf, data, size);
 }
 
-MSTidyBool mailspring_tidyOptSetBool(MSTidyDoc tdoc, unsigned int optId, MSTidyBool val) {
+MSTidyBool summermail_tidyOptSetBool(MSTidyDoc tdoc, unsigned int optId, MSTidyBool val) {
     return s_tidyOptSetBool ? s_tidyOptSetBool(tdoc, optId, val) : MSTidyNo;
 }
 
-MSTidyBool mailspring_tidyOptSetInt(MSTidyDoc tdoc, unsigned int optId, unsigned long val) {
+MSTidyBool summermail_tidyOptSetInt(MSTidyDoc tdoc, unsigned int optId, unsigned long val) {
     return s_tidyOptSetInt ? s_tidyOptSetInt(tdoc, optId, val) : MSTidyNo;
 }
 
-int mailspring_tidySetCharEncoding(MSTidyDoc tdoc, const char* encnam) {
+int summermail_tidySetCharEncoding(MSTidyDoc tdoc, const char* encnam) {
     return s_tidySetCharEncoding ? s_tidySetCharEncoding(tdoc, encnam) : -1;
 }
 
-int mailspring_tidySetErrorBuffer(MSTidyDoc tdoc, MSTidyBuffer* errbuf) {
+int summermail_tidySetErrorBuffer(MSTidyDoc tdoc, MSTidyBuffer* errbuf) {
     return s_tidySetErrorBuffer ? s_tidySetErrorBuffer(tdoc, errbuf) : -1;
 }
 
-int mailspring_tidyParseBuffer(MSTidyDoc tdoc, MSTidyBuffer* buf) {
+int summermail_tidyParseBuffer(MSTidyDoc tdoc, MSTidyBuffer* buf) {
     return s_tidyParseBuffer ? s_tidyParseBuffer(tdoc, buf) : -1;
 }
 
-int mailspring_tidyCleanAndRepair(MSTidyDoc tdoc) {
+int summermail_tidyCleanAndRepair(MSTidyDoc tdoc) {
     return s_tidyCleanAndRepair ? s_tidyCleanAndRepair(tdoc) : -1;
 }
 
-int mailspring_tidySaveBuffer(MSTidyDoc tdoc, MSTidyBuffer* buf) {
+int summermail_tidySaveBuffer(MSTidyDoc tdoc, MSTidyBuffer* buf) {
     return s_tidySaveBuffer ? s_tidySaveBuffer(tdoc, buf) : -1;
 }
 
 // Getters for dynamically resolved option IDs
-unsigned int mailspring_tidyOptId_XhtmlOut(void) { return s_optXhtmlOut; }
-unsigned int mailspring_tidyOptId_DoctypeMode(void) { return s_optDoctypeMode; }
-unsigned int mailspring_tidyOptId_Mark(void) { return s_optMark; }
-unsigned int mailspring_tidyOptId_ForceOutput(void) { return s_optForceOutput; }
-unsigned int mailspring_tidyOptId_ShowWarnings(void) { return s_optShowWarnings; }
-unsigned int mailspring_tidyOptId_ShowErrors(void) { return s_optShowErrors; }
+unsigned int summermail_tidyOptId_XhtmlOut(void) { return s_optXhtmlOut; }
+unsigned int summermail_tidyOptId_DoctypeMode(void) { return s_optDoctypeMode; }
+unsigned int summermail_tidyOptId_Mark(void) { return s_optMark; }
+unsigned int summermail_tidyOptId_ForceOutput(void) { return s_optForceOutput; }
+unsigned int summermail_tidyOptId_ShowWarnings(void) { return s_optShowWarnings; }
+unsigned int summermail_tidyOptId_ShowErrors(void) { return s_optShowErrors; }
 
 #endif // __linux__

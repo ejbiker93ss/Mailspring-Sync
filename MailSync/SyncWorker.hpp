@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #ifndef SyncWorker_hpp
@@ -74,7 +74,7 @@ private:
     bool syncMicrosoftGraphMessages();
     void syncMicrosoftGraphMessageBody(Message * message);
     
-    void ensureRootMailspringFolder(vector<string> containerFolderComponents, Array * remoteFolders);
+    void ensureRootSummerMailFolder(vector<string> containerFolderComponents, Array * remoteFolders);
 
     bool initialSyncFolderIncremental(Folder & folder, IMAPFolderStatus & remoteStatus);
         

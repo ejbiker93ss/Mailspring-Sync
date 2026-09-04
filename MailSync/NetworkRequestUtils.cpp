@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "Identity.hpp"
@@ -86,7 +86,7 @@ const json MakeOAuthRefreshRequest(string provider, string clientId, string refr
     if (provider == "gmail" && clientId == gmailClientId) {
         // per https://stackoverflow.com/questions/59416326/safely-distribute-oauth-2-0-client-secret-in-desktop-applications-in-python,
         // we really do need to embed this in the application and it's more an extension of the Client ID than a proper Client Secret.
-        // For a full explanation, see onboarding-helpers.ts in Mailspring. Please don't re-use this client id + secret in derivative
+        // For a full explanation, see onboarding-helpers.ts in SummerMail. Please don't re-use this client id + secret in derivative
         // works or other products.
         payload += "&client_secret=" + gmailClientSecret;
     }

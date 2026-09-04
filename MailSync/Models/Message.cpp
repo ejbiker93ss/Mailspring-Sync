@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "Message.hpp"
@@ -168,7 +168,7 @@ bool Message::isDeletionPlaceholder() {
 }
 
 bool Message::isHiddenReminder() {
-    // check for "Ben via Mailspring" reminders / unsnoozes
+    // check for "Ben via SummerMail" reminders / unsnoozes
     if (from().size() != 1) {
         return false;
     }
@@ -180,7 +180,12 @@ bool Message::isHiddenReminder() {
         return false;
     }
     auto fromEnd = fromName.substr(fromName.length() - 14, 14);
-    return (fromEnd == "via Mailspring");
+    if (fromEnd == "via SummerMail") {
+        return true;
+    }
+    const string legacySuffix = "via Mailspring";
+    return fromName.length() >= legacySuffix.length() &&
+        fromName.substr(fromName.length() - legacySuffix.length()) == legacySuffix;
 }
 
 // mutable attributes
@@ -272,7 +277,7 @@ void Message::setFiles(vector<File> & files) {
     _data["files"] = arr;
 }
 
-/* Mailspring displays the "attachment" icon only if the following criteria are met.
+/* SummerMail displays the "attachment" icon only if the following criteria are met.
    To make search and the thread list consistent, I'm moving the impl here to C++.
  
  !f.contentId || f.size > 12 * 1024

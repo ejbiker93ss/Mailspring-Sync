@@ -63,7 +63,7 @@ possible, rather than starting duplicate conversations.
 
 Additionally, **no spam**. Do not post any content which is intended primarily
 for promotional purposes or creating backlinks. The one exception to this rule
-is promoting Mailspring plugins and themes, in the appropriate dedicated
+is promoting SummerMail plugins and themes, in the appropriate dedicated
 category, or in response to a question, issue, or feature request as
 appropriate.
 
@@ -94,9 +94,7 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement either through
-the flag feature on our Discourse, or by sending an email to
-`conduct@getmailspring.com`. All complaints will be reviewed and investigated
+reported to the project maintainers privately. All complaints will be reviewed and investigated
 promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the

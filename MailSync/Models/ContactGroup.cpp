@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "ContactGroup.hpp"
@@ -110,7 +110,7 @@ void ContactGroup::syncMembers(MailStore * store, vector<string> newContactIds) 
         insertMembers.reset();
     }
     
-    // update the actual contacts. This is unfortunately necessary because Mailspring
+    // update the actual contacts. This is unfortunately necessary because SummerMail
     // will not update live queries unless the membershsip data is on the actual models
     vector<string> all {};
     all.insert(all.end(), oldContactIds.begin(), oldContactIds.end());

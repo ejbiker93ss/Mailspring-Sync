@@ -2,7 +2,7 @@
 
 ## Overview
 
-`TaskProcessor` is responsible for executing local and remote tasks from the Mailspring client. Local tasks run on the main thread as tasks are received, while remote tasks run on the foreground worker thread with network access.
+`TaskProcessor` is responsible for executing local and remote tasks from the SummerMail client. Local tasks run on the main thread as tasks are received, while remote tasks run on the foreground worker thread with network access.
 
 ### Task Types Supported
 

@@ -1,7 +1,7 @@
-# Contributing to Mailspring-Sync
+# Contributing to SummerMail-Sync
 
 We're always looking for help improving the stability, performance, and
-functionality of Mailspring-Sync. There are a few ways to get involved:
+functionality of SummerMail-Sync. There are a few ways to get involved:
 
 ## Contributing Code
 
@@ -10,7 +10,7 @@ One of the best ways is to grab a
 [sync issue](https://community.getmailspring.com/c/sync/22),
 or [feature suggestion](https://community.getmailspring.com/c/features/12)
 that has been marked `accepted` and dig in. We mark anything specific to
-Mailspring-Sync with `mailsync`. You can especially look for issues
+SummerMail-Sync with `mailsync`. You can especially look for issues
 marked as `help-wanted` or `low-hanging-fruit`.
 
 Please be wary of working on issues *not* marked as `accepted`. Just because
@@ -27,7 +27,7 @@ business logic at the same time.
 The first time you submit a pull request, a bot will ask you to sign a
 standard, bare-bones Contributor License Agreement. The CLA states that you
 waive any patent or copyright claims you might have to the code you're
-contributing. (For example, you can't submit a PR and then sue Mailspring
+contributing. (For example, you can't submit a PR and then sue SummerMail
 for using your code.)
 
 ## Triaging Issues
@@ -48,12 +48,12 @@ We're in the process of migrating. If someone has already reported a bug or
 requested the feature you have in mind,  **vote for it** at the top.
 Higher voted issues are more likely to be addressed.
 
-For bugs, please verify that you're running the latest version of Mailspring
+For bugs, please verify that you're running the latest version of SummerMail
 (and thus, Mailsync). If you file an issue without providing detail, we may
 close it without comment.
 
 **Under no circumstances should you report an issue via GitHub. The GitHub
-Issues feature is exclusively for Mailspring contributors to track tasks
+Issues feature is exclusively for SummerMail contributors to track tasks
 which have been diagnosed, accepted, and scheduled on the roadmap.**
 
 # Build and Run From Source

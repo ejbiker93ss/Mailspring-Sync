@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
-  "name": "mailspring-sync",
+  "name": "summermail-sync",
   "version": "1.0.0",
-  "description": "Native sync engine for Mailspring email client",
+  "description": "Native sync engine for SummerMail email client",
   "dependencies": [
     "openssl",
     {

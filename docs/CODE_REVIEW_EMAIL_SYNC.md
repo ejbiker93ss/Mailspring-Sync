@@ -1,4 +1,4 @@
-# Code Review: Mailspring-Sync Email Synchronization
+# Code Review: SummerMail-Sync Email Synchronization
 
 ## Executive Summary
 

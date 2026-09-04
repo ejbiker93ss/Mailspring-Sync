@@ -2,7 +2,7 @@
 
 ## Overview
 
-`DeltaStream` is a singleton class responsible for broadcasting database events to stdout as newline-separated JSON. It implements buffering and "repeated save collapsing" logic to avoid spamming the Mailspring client with unnecessary events.
+`DeltaStream` is a singleton class responsible for broadcasting database events to stdout as newline-separated JSON. It implements buffering and "repeated save collapsing" logic to avoid spamming the SummerMail client with unnecessary events.
 
 ### Usage Patterns
 

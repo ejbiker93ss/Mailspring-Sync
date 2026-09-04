@@ -13,7 +13,7 @@
 #include <sstream>
 
 /**
- Originally Mailspring mailsync was going to use BelCard and the integration was actually working
+ Originally SummerMail mailsync was going to use BelCard and the integration was actually working
  pretty well, but on Linux it caused the app to link against glibc on Ubuntu 14 (trusty) in a way
  that prevented it from being relocated to Ubuntu 18. This was very concerning and I didn't know
  how to fix it, so I re-evaluated what we needed.

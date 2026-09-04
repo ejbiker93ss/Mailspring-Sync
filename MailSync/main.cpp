@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include <atomic>
@@ -48,7 +48,7 @@
 #include "SPDLogExtensions.hpp"
 
 #if defined(__linux__)
-#include "MailspringDynamicTidy.h"
+#include "SummerMailDynamicTidy.h"
 #endif
 
 using namespace nlohmann;
@@ -127,7 +127,7 @@ struct CArg: public option::Arg
 
 // Important do not change these without updating result code 2 check below
 #define USAGE_STRING "USAGE: CONFIG_DIR_PATH=/path IDENTITY_SERVER=https://id.getmailspring.com mailsync [options]\n\nOptions:"
-#define USAGE_IDENTITY "  --identity, -i  \tRequired: Mailspring Identity JSON with credentials."
+#define USAGE_IDENTITY "  --identity, -i  \tRequired: SummerMail Identity JSON with credentials."
 
 enum  optionIndex { UNKNOWN, HELP, IDENTITY, ACCOUNT, MODE, ORPHAN, VERBOSE };
 const option::Descriptor usage[] =
@@ -525,7 +525,7 @@ int runInstallCheck() {
 
         // Use intentionally invalid credentials to test SASL mechanism loading
         // The email format is valid but the credentials are obviously fake
-        smtp.setUsername(MCSTR("mailspring-install-check@gmail.com"));
+        smtp.setUsername(MCSTR("summermail-install-check@gmail.com"));
         smtp.setPassword(MCSTR("invalid-password-for-sasl-test"));
 
         ErrorCode err = ErrorNone;
@@ -536,7 +536,7 @@ int runInstallCheck() {
         } else {
             // Connection succeeded, now try to authenticate
             // This will fail with wrong credentials, but we're testing that SASL works
-            Address * testAddr = Address::addressWithMailbox(MCSTR("mailspring-install-check@gmail.com"));
+            Address * testAddr = Address::addressWithMailbox(MCSTR("summermail-install-check@gmail.com"));
             smtp.checkAccount(testAddr, &err);
 
             if (err == ErrorNone) {
@@ -578,8 +578,8 @@ int runInstallCheck() {
     // Step 4: Check libtidy by actually processing HTML (Linux only)
     string tidyError = "";
 #if defined(__linux__)
-    if (!mailspring_tidy_available()) {
-        const char* err = mailspring_tidy_error();
+    if (!summermail_tidy_available()) {
+        const char* err = summermail_tidy_error();
         tidyError = err ? err : "libtidy not available";
     } else {
         // Actually test tidy by processing sample HTML, same as MCHTMLCleaner::cleanHTML
@@ -587,31 +587,31 @@ int runInstallCheck() {
         MSTidyBuffer errbuf = {0};
         MSTidyBuffer docbuf = {0};
 
-        MSTidyDoc tdoc = mailspring_tidyCreate();
+        MSTidyDoc tdoc = summermail_tidyCreate();
         if (tdoc == NULL) {
             tidyError = "tidyCreate returned NULL";
         } else {
-            mailspring_tidyBufInit(&output);
-            mailspring_tidyBufInit(&errbuf);
-            mailspring_tidyBufInit(&docbuf);
+            summermail_tidyBufInit(&output);
+            summermail_tidyBufInit(&errbuf);
+            summermail_tidyBufInit(&docbuf);
 
             // Test with simple HTML
             const char* testHTML = "<html><body><p>Test</p></body></html>";
-            mailspring_tidyBufAppend(&docbuf, (void*)testHTML, strlen(testHTML));
+            summermail_tidyBufAppend(&docbuf, (void*)testHTML, strlen(testHTML));
 
             // Use dynamically resolved option IDs for libtidy version compatibility
-            mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_XhtmlOut(), MSTidyYes);
-            mailspring_tidyOptSetInt(tdoc, mailspring_tidyOptId_DoctypeMode(), MSTidyDoctypeUser);
-            mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_Mark(), MSTidyNo);
-            mailspring_tidySetCharEncoding(tdoc, "utf8");
-            mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_ForceOutput(), MSTidyYes);
-            mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_ShowWarnings(), MSTidyNo);
-            mailspring_tidyOptSetInt(tdoc, mailspring_tidyOptId_ShowErrors(), 0);
-            mailspring_tidySetErrorBuffer(tdoc, &errbuf);
+            summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_XhtmlOut(), MSTidyYes);
+            summermail_tidyOptSetInt(tdoc, summermail_tidyOptId_DoctypeMode(), MSTidyDoctypeUser);
+            summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_Mark(), MSTidyNo);
+            summermail_tidySetCharEncoding(tdoc, "utf8");
+            summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_ForceOutput(), MSTidyYes);
+            summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_ShowWarnings(), MSTidyNo);
+            summermail_tidyOptSetInt(tdoc, summermail_tidyOptId_ShowErrors(), 0);
+            summermail_tidySetErrorBuffer(tdoc, &errbuf);
 
-            int parseResult = mailspring_tidyParseBuffer(tdoc, &docbuf);
-            int cleanResult = mailspring_tidyCleanAndRepair(tdoc);
-            int saveResult = mailspring_tidySaveBuffer(tdoc, &output);
+            int parseResult = summermail_tidyParseBuffer(tdoc, &docbuf);
+            int cleanResult = summermail_tidyCleanAndRepair(tdoc);
+            int saveResult = summermail_tidySaveBuffer(tdoc, &output);
 
             if (parseResult < 0 || cleanResult < 0 || saveResult < 0) {
                 tidyError = "tidy processing failed (parse=" + to_string(parseResult) +
@@ -621,10 +621,10 @@ int runInstallCheck() {
                 tidyError = "tidy produced no output";
             }
 
-            mailspring_tidyBufFree(&docbuf);
-            mailspring_tidyBufFree(&output);
-            mailspring_tidyBufFree(&errbuf);
-            mailspring_tidyRelease(tdoc);
+            summermail_tidyBufFree(&docbuf);
+            summermail_tidyBufFree(&output);
+            summermail_tidyBufFree(&errbuf);
+            summermail_tidyRelease(tdoc);
         }
     }
 #endif

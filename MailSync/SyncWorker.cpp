@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 #include <algorithm>
 #include <functional>
@@ -476,7 +476,7 @@ bool SyncWorker::syncNow()
             //
             // 1) Set remoteUID to the "UNLINKED" value for every message in the folder
             // 2) Run a 'deep' scan which will refetch the metadata for the messages,
-            //    compute the Mailspring message IDs and re-map local models to remote UIDs.
+            //    compute the SummerMail message IDs and re-map local models to remote UIDs.
             //
             // Notes:
             // - It's very important that this not generate deltas - because we're only changing
@@ -631,7 +631,7 @@ bool SyncWorker::syncNow()
     return syncAgainImmediately;
 }
 
-void SyncWorker::ensureRootMailspringFolder(vector<string> containerFolderComponents, Array * remoteFolders)
+void SyncWorker::ensureRootSummerMailFolder(vector<string> containerFolderComponents, Array * remoteFolders)
 {
     auto components = Array::array();
     for (string containerFolderComponent : containerFolderComponents) {
@@ -652,9 +652,9 @@ void SyncWorker::ensureRootMailspringFolder(vector<string> containerFolderCompon
         ErrorCode err = ErrorCode::ErrorNone;
         session.createFolder(desiredPath, &err);
         if (err) {
-            logger->error("Could not create Mailspring container folder: {}. {}", desiredPath->UTF8Characters(), ErrorCodeToTypeMap[err]);
+            logger->error("Could not create SummerMail container folder: {}. {}", desiredPath->UTF8Characters(), ErrorCodeToTypeMap[err]);
         } else {
-            logger->error("Created Mailspring container folder: {}.", desiredPath->UTF8Characters());
+            logger->error("Created SummerMail container folder: {}.", desiredPath->UTF8Characters());
         }
     }
 }
@@ -811,9 +811,9 @@ vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
     string containerFolderPath = account->containerFolder();
     vector<string> containerFolderComponents;
 
-    if (containerFolderPath == "" || containerFolderPath == MAILSPRING_FOLDER_PREFIX_V2) {
+    if (containerFolderPath == "" || containerFolderPath == SUMMERMAIL_FOLDER_PREFIX_V2) {
       logger->info("Syncing folder list...");
-      containerFolderComponents.push_back(MAILSPRING_FOLDER_PREFIX_V2);
+      containerFolderComponents.push_back(SUMMERMAIL_FOLDER_PREFIX_V2);
     } else {
       logger->info("Syncing folder list on custom container folder {} ...", containerFolderPath);
 
@@ -834,33 +834,33 @@ vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
     string mainPrefix = MailUtils::namespacePrefixOrBlank(&session);
     bool ensuredRoot = false;
     
-    // create required Mailspring folders if they don't exist
+    // create required SummerMail folders if they don't exist
     // TODO: Consolidate this into role association code below, and make it
     // use the same business logic as creating / updating folders from tasks.
     // Accounts with create_helper_folders=false (e.g. O365 shared mailboxes, where
     // any folder we create is visible to every member of the mailbox) are skipped;
     // features depending on these folders (snooze) are unavailable there.
-    vector<string> mailspringFolders{};
+    vector<string> summermailFolders{};
     if (account->createHelperFolders()) {
-        mailspringFolders.push_back("Snoozed");
+        summermailFolders.push_back("Snoozed");
     }
 
-    for (string mailspringFolder : mailspringFolders) {
-        string mailspringRole = mailspringFolder;
-        transform(mailspringRole.begin(), mailspringRole.end(), mailspringRole.begin(), ::tolower);
+    for (string summermailFolder : summermailFolders) {
+        string summermailRole = summermailFolder;
+        transform(summermailRole.begin(), summermailRole.end(), summermailRole.begin(), ::tolower);
 
         bool exists = false;
         for (int ii = ((int)remoteFolders->count()) - 1; ii >= 0; ii--) {
             IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
             string remoteRole = MailUtils::roleForFolder(containerFolderPath, mainPrefix, remote);
-            if (remoteRole == mailspringRole) {
+            if (remoteRole == summermailRole) {
                 exists = true;
                 break;
             }
         }
         if (!exists) {
             if (!ensuredRoot) {
-                ensureRootMailspringFolder(containerFolderComponents, remoteFolders);
+                ensureRootSummerMailFolder(containerFolderComponents, remoteFolders);
                 ensuredRoot = true;
             }
             
@@ -868,14 +868,14 @@ vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
             for (string containerFolderComponent : containerFolderComponents) {
               components->addObject(AS_MCSTR(containerFolderComponent));
             }
-            components->addObject(AS_MCSTR(mailspringFolder));
+            components->addObject(AS_MCSTR(summermailFolder));
             String * desiredPath = session.defaultNamespace()->pathForComponents(components);
             session.createFolder(desiredPath, &err);
             if (err) {
-                logger->error("Could not create required Mailspring folder: {}. {}", desiredPath->UTF8Characters(), ErrorCodeToTypeMap[err]);
+                logger->error("Could not create required SummerMail folder: {}. {}", desiredPath->UTF8Characters(), ErrorCodeToTypeMap[err]);
                 continue;
             }
-            logger->error("Created required Mailspring folder: {}.", desiredPath->UTF8Characters());
+            logger->error("Created required SummerMail folder: {}.", desiredPath->UTF8Characters());
             IMAPFolder * fake = new IMAPFolder();
             fake->autorelease();
             fake->setPath(desiredPath);

@@ -43,7 +43,7 @@ elif [[ "$OSTYPE" == "linux-gnu" ]]; then
   make MailCore  # Only build the library, not tests (tests can't link without mailsync)
 
   # build mailsync
-  echo "Building Mailspring MailSync..."
+  echo "Building SummerMail MailSync..."
   cd "$MAILSYNC_DIR"
   cmake .
   make

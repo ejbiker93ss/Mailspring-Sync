@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 #include <map>
 #include <libetpan/mailsmtp_types.h>
@@ -28,8 +28,10 @@ static string FS_PATH_SEP = "\\";
 static string FS_PATH_SEP = "/";
 #endif
 
-static string MAILSPRING_FOLDER_PREFIX_V1 = "[Mailspring]";
-static string MAILSPRING_FOLDER_PREFIX_V2 = "Mailspring";
+static string SUMMERMAIL_FOLDER_PREFIX_V1 = "[SummerMail]";
+static string SUMMERMAIL_FOLDER_PREFIX_V2 = "SummerMail";
+static string LEGACY_MAIL_FOLDER_PREFIX_V1 = "[Mailspring]";
+static string LEGACY_MAIL_FOLDER_PREFIX_V2 = "Mailspring";
 
 static vector<string> ACCOUNT_RESET_QUERIES = {
     "DELETE FROM `ThreadCounts` WHERE `categoryId` IN (SELECT id FROM `Folder` WHERE `accountId` = ?)",
@@ -290,6 +292,8 @@ static map<string, string> COMMON_FOLDER_NAMES = {
     {"draftbox", "drafts"},
     {"robocze", "drafts"},
 
+    {"SummerMail/Snoozed", "snoozed"},
+    {"SummerMail.Snoozed", "snoozed"},
     {"Mailspring/Snoozed", "snoozed"},
     {"Mailspring.Snoozed", "snoozed"},
 };

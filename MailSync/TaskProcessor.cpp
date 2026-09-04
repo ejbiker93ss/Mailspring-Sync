@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "TaskProcessor.hpp"
@@ -675,7 +675,7 @@ Message TaskProcessor::inflateClientDraftJSON(json & draftJSON, shared_ptr<Messa
             folder = store->find<Folder>(q);
         }
         if (folder == nullptr) {
-            throw SyncException("no-drafts-folder", "Mailspring can't find your Drafts folder. To create and send mail, visit Preferences > Folders and choose a Drafts folder.", false);
+            throw SyncException("no-drafts-folder", "SummerMail can't find your Drafts folder. To create and send mail, visit Preferences > Folders and choose a Drafts folder.", false);
         }
         base = {
             {"remoteUID", 0},
@@ -959,7 +959,7 @@ void TaskProcessor::performLocalDestroyDraft(Task * task) {
     // Find the trash folder
     auto trash = store->find<Folder>(Query().equal("accountId", account->id()).equal("role", "trash"));
     if (trash == nullptr) {
-        throw SyncException("no-trash-folder", "Mailspring doesn't know which folder to use for trash. Visit Preferences > Folders to assign a trash folder.", false);
+        throw SyncException("no-trash-folder", "SummerMail doesn't know which folder to use for trash. Visit Preferences > Folders to assign a trash folder.", false);
     }
 
     auto stubIds = json::array();
@@ -1591,7 +1591,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
     if (sent == nullptr) {
         sent = store->find<Label>(Query().equal("accountId", account->id()).equal("role", "sent"));
         if (sent == nullptr) {
-            throw SyncException("no-sent-folder", "Mailspring doesn't know which folder to use for sent mail. Visit Preferences > Folders to assign a sent folder.", false);
+            throw SyncException("no-sent-folder", "SummerMail doesn't know which folder to use for sent mail. Visit Preferences > Folders to assign a sent folder.", false);
         }
     }
     String * sentPath = AS_MCSTR(sent->path());
@@ -1618,7 +1618,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
 
     builder.header()->setSubject(AS_MCSTR(draft.subject()));
     builder.header()->setMessageID(AS_MCSTR(draft.headerMessageId()));
-    builder.header()->setUserAgent(MCSTR("Mailspring"));
+    builder.header()->setUserAgent(MCSTR("SummerMail"));
     builder.header()->setDate(time(0));
     
     // todo: lookup thread reference entire chain?
@@ -2626,7 +2626,7 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
     }
 
     // Generate a unique boundary for multipart message
-    string boundary = "----=_Mailspring_RSVP_" + to_string(time(0)) + "_" + to_string(rand());
+    string boundary = "----=_SummerMail_RSVP_" + to_string(time(0)) + "_" + to_string(rand());
 
     // Base64 encode the ICS data (RFC 6047 recommends base64 for maximum compatibility)
     Data * icsData = AS_MCSTR(ics)->dataUsingEncoding("utf-8");
@@ -2635,7 +2635,7 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
     // Build MIME headers
     MessageBuilder builder;
     builder.header()->setSubject(AS_MCSTR(subject));
-    builder.header()->setUserAgent(MCSTR("Mailspring"));
+    builder.header()->setUserAgent(MCSTR("SummerMail"));
     builder.header()->setDate(time(0));
 
     Array * toArray = Array::array();
