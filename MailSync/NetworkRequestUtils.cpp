@@ -83,12 +83,26 @@ const json MakeOAuthRefreshRequest(string provider, string clientId, string refr
 
     string gmailClientId = MailUtils::getEnvUTF8("GMAIL_CLIENT_ID");
     string gmailClientSecret = MailUtils::getEnvUTF8("GMAIL_CLIENT_SECRET");
-    if (provider == "gmail" && clientId == gmailClientId) {
+    string legacyGmailClientId = MailUtils::getEnvUTF8("LEGACY_GMAIL_CLIENT_ID");
+    string legacyGmailClientSecret = MailUtils::getEnvUTF8("LEGACY_GMAIL_CLIENT_SECRET");
+    if (provider == "gmail" && clientId == gmailClientId && gmailClientSecret != "") {
         // per https://stackoverflow.com/questions/59416326/safely-distribute-oauth-2-0-client-secret-in-desktop-applications-in-python,
         // we really do need to embed this in the application and it's more an extension of the Client ID than a proper Client Secret.
         // For a full explanation, see onboarding-helpers.ts in SummerMail. Please don't re-use this client id + secret in derivative
         // works or other products.
-        payload += "&client_secret=" + gmailClientSecret;
+        char * secret = curl_easy_escape(curl_handle, gmailClientSecret.c_str(), 0);
+        if (secret != nullptr) {
+            payload += "&client_secret=" + string(secret);
+            curl_free(secret);
+        }
+    } else if (provider == "gmail" && clientId == legacyGmailClientId && legacyGmailClientSecret != "") {
+        // Refresh tokens remain bound to the OAuth client that issued them.
+        // This path keeps pre-SummerMail Gmail accounts working after migration.
+        char * secret = curl_easy_escape(curl_handle, legacyGmailClientSecret.c_str(), 0);
+        if (secret != nullptr) {
+            payload += "&client_secret=" + string(secret);
+            curl_free(secret);
+        }
     }
 
     // Store headers in CurlRequestData for proper cleanup
