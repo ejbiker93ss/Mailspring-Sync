@@ -2592,6 +2592,15 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
         attendeeEmail = attendeeInfo;
     }
 
+    // The parser may preserve the iCalendar URI scheme. Compare actual mailbox
+    // addresses rather than treating "MAILTO:user@example.com" as a different
+    // sender from "user@example.com".
+    string lowerAttendeePrefix = attendeeEmail;
+    transform(lowerAttendeePrefix.begin(), lowerAttendeePrefix.end(), lowerAttendeePrefix.begin(), ::tolower);
+    if (lowerAttendeePrefix.find("mailto:") == 0) {
+        attendeeEmail = attendeeEmail.substr(7);
+    }
+
     // Validation 7: Verify From address matches ATTENDEE email (RFC 6047 requirement)
     // Mismatches may cause the RSVP to be rejected by the organizer's calendar
     string fromEmail = account->emailAddress();

@@ -60,6 +60,15 @@ string Calendar::syncToken() {
     return _data.count("syncToken") ? _data["syncToken"].get<string>() : "";
 }
 
+long long Calendar::lastEventReconciliation() {
+    return _data.count("lastEventReconciliation") && _data["lastEventReconciliation"].is_number()
+        ? _data["lastEventReconciliation"].get<long long>() : 0;
+}
+
+void Calendar::setLastEventReconciliation(long long timestamp) {
+    _data["lastEventReconciliation"] = timestamp;
+}
+
 void Calendar::setSyncToken(string token) {
     _data["syncToken"] = token;
 }

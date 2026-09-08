@@ -10,6 +10,7 @@
 //
 
 #include "DAVWorker.hpp"
+#include "CalendarSyncPolicy.hpp"
 #include "DAVUtils.hpp"
 #include "ContactGroup.hpp"
 #include "MailStore.hpp"
@@ -118,6 +119,11 @@ struct ParsedContact {
     string name;
     bool isGroup;
 };
+
+static string firstVCardEmail(const shared_ptr<VCard>& vcard) {
+    auto emails = vcard->getEmails();
+    return emails.empty() ? "" : emails.front()->getValue();
+}
 
 struct ParsedCalEvent {
     string etag;
@@ -908,7 +914,10 @@ void DAVWorker::runForAddressBook(shared_ptr<ContactBook> ab) {
     map<ETAG, string> remote {};
 
     {
-        auto etagsDoc = performXMLRequest(ab->url(), "REPORT", "<c:addressbook-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><d:getetag /></d:prop></c:addressbook-query>");
+        // RFC 6352 requires the filter element even when every card should
+        // match. SmarterMail rejects the previously abbreviated query with
+        // HTTP 400, while more permissive CardDAV servers happened to accept it.
+        auto etagsDoc = performXMLRequest(ab->url(), "REPORT", "<c:addressbook-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><d:getetag /></d:prop><c:filter /></c:addressbook-query>");
 
         etagsDoc->evaluateXPath("//D:response", ([&](xmlNodePtr node) {
             auto etag = etagsDoc->nodeContentAtXPath(".//D:getetag/text()", node);
@@ -983,7 +992,7 @@ void DAVWorker::runForAddressBook(shared_ptr<ContactBook> ab) {
             }
             string id = vcard->getUniqueId()->getValue();
             if (id == "") id = MailUtils::idForCalendar(account->id(), href);
-            string email = vcard->getEmails().front()->getValue();
+            string email = firstVCardEmail(vcard);
             string name = vcard->getFormattedName()->getValue();
             if (name == "") name = vcard->getName()->getValue();
             bool isGroup = DAVUtils::isGroupCard(vcard);
@@ -1237,7 +1246,7 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
                 }
                 string id = vcard->getUniqueId()->getValue();
                 if (id == "") id = MailUtils::idForCalendar(account->id(), href);
-                string email = vcard->getEmails().front()->getValue();
+                string email = firstVCardEmail(vcard);
                 string name = vcard->getFormattedName()->getValue();
                 if (name == "") name = vcard->getName()->getValue();
                 bool isGroup = DAVUtils::isGroupCard(vcard);
@@ -1366,7 +1375,7 @@ shared_ptr<Contact> DAVWorker::ingestAddressDataNode(shared_ptr<DavXML> doc, xml
     }
     string id = vcard->getUniqueId()->getValue();
     if (id == "") id = MailUtils::idForCalendar(account->id(), href);
-    string email = vcard->getEmails().front()->getValue();
+    string email = firstVCardEmail(vcard);
     string name = vcard->getFormattedName()->getValue();
     if (name == "") name = vcard->getName()->getValue();
     
@@ -1547,13 +1556,16 @@ void DAVWorker::runCalendars() {
         bool readOnly = hasPrivilegeSet && !hasWritePrivilege;
 
         shared_ptr<Calendar> calendar = local[id];
+        const auto now = static_cast<long long>(time(nullptr));
+        const auto lastAudit = calendar ? calendar->lastEventReconciliation() : 0;
+        const bool reconciliationDue = CalendarSyncPolicy::reconciliationDue(lastAudit, now);
         bool needsSync = true;
         bool metadataChanged = false;
 
         // upsert the Calendar object
         if (calendar) {
             // Existing calendar - check if ctag changed
-            if (calendar->ctag() == ctag && ctag != "") {
+            if (!reconciliationDue && calendar->ctag() == ctag && ctag != "") {
                 logger->info("Calendar '{}' unchanged (ctag: {}), skipping sync", name, ctag);
                 needsSync = false;
             }
@@ -1621,9 +1633,13 @@ void DAVWorker::runCalendars() {
             // return errors instead of graceful decline (Zimbra, Posteo), or have unreliable
             // implementations (Synology, DAViCal, Bedework, Nextcloud). See function comments.
             string calURL = (path.find("://") != string::npos) ? path : replacePath(calendarHomeURL, path);
-            bool usedSyncToken = runForCalendarWithSyncToken(id, calURL, calendar);
+            // Periodically compare the bounded ETag inventory even if both ctag
+            // and sync-token would otherwise conceal a previously missed item.
+            bool usedSyncToken = !reconciliationDue && runForCalendarWithSyncToken(id, calURL, calendar);
             if (!usedSyncToken) {
                 runForCalendar(id, name, calURL);
+                calendar->setLastEventReconciliation(static_cast<long long>(time(nullptr)));
+                store->save(calendar.get());
             }
 
             // Update ctag after successful sync
@@ -1641,6 +1657,7 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
 
     // Remote: href -> etag (from server)
     map<string, string> remote {};
+    map<string, string> originalHrefs {};
     {
         // Request events within the time range. The server expands recurring events
         // and returns any event where at least one instance falls within the range.
@@ -1683,10 +1700,20 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
 
         auto eventEtagsDoc = performXMLRequest(url, "REPORT", query);
 
+        bool validInventory = false;
+        eventEtagsDoc->evaluateXPath("/D:multistatus", [&](xmlNodePtr) { validInventory = true; });
+        if (!validInventory) {
+            throw SyncException("incomplete-calendar-list", "Calendar inventory is not a DAV multistatus response", true);
+        }
+
         eventEtagsDoc->evaluateXPath("//D:response", ([&](xmlNodePtr node) {
             auto etag = eventEtagsDoc->nodeContentAtXPath(".//D:getetag/text()", node);
             auto href = eventEtagsDoc->nodeContentAtXPath(".//D:href/text()", node);
+            if (href.empty() || etag.empty()) {
+                throw SyncException("incomplete-calendar-list", "Calendar inventory contains an unsuccessful resource response", true);
+            }
             remote[normalizeHref(href)] = string(etag.c_str());
+            originalHrefs[normalizeHref(href)] = href;
         }));
     }
 
@@ -1741,20 +1768,10 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
         logger->info("  needed: {}", neededHrefs.size());
     }
 
-    // Process deletions in their own short transactions before multiget
-    for (auto & deletionChunk : MailUtils::chunksOfVector(deletedIcsUIDs, 100)) {
-        MailStoreTransaction transaction{store, "runForCalendar:deletions"};
-        auto deletionEvents = store->findAll<Event>(Query().equal("calendarId", calendarId).equal("icsuid", deletionChunk));
-        for (auto & e : deletionEvents) {
-            store->remove(e.get());
-        }
-        transaction.commit();
-    }
-
     for (auto chunk : MailUtils::chunksOfVector(neededHrefs, 90)) {
         string payload = "";
         for (auto & href : chunk) {
-            payload += "<d:href>" + href + "</d:href>";
+            payload += "<d:href>" + CalendarSyncPolicy::hrefText(originalHrefs.at(href)) + "</d:href>";
         }
 
         // Fetch the data (rate limiting is now handled in performXMLRequest)
@@ -1763,6 +1780,7 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
         // Phase 1: Parse ICS data OUTSIDE the transaction
         vector<shared_ptr<ICalendar>> parsedCalendars;
         vector<ParsedCalEvent> parsedEvents;
+        set<string> receivedHrefs;
 
         icsDoc->evaluateXPath("//D:response", ([&](xmlNodePtr node) {
             auto etag = icsDoc->nodeContentAtXPath(".//D:getetag/text()", node);
@@ -1781,16 +1799,24 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
             parsedCalendars.push_back(cal);
 
             auto href = icsDoc->nodeContentAtXPath(".//D:href/text()", node);
+            bool complete = true;
 
             // Process ALL VEVENTs in the ICS file (master + any recurrence exceptions)
             for (auto icsEvent : cal->Events) {
                 if (icsEvent->DtStart.IsEmpty()) {
-                    logger->info("Received calendar event but it has no start time?\n\n{}\n\n", icsData);
+                    complete = false;
                     continue;
                 }
                 parsedEvents.push_back({etag, href, icsData, icsEvent});
             }
+            if (complete) receivedHrefs.insert(normalizeHref(href));
         }));
+
+        for (const auto& href : chunk) {
+            if (!receivedHrefs.count(href)) {
+                throw SyncException("incomplete-calendar-fetch", "Calendar download was incomplete; retaining the previous sync checkpoint for retry", true);
+            }
+        }
 
         // Phase 2: DB operations INSIDE a short transaction
         {
@@ -1820,6 +1846,13 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
             }
             transaction.commit();
         }
+    }
+    // Only prune after every requested resource has downloaded and parsed.
+    for (auto & deletionChunk : MailUtils::chunksOfVector(deletedIcsUIDs, 100)) {
+        MailStoreTransaction transaction{store, "runForCalendar:deletions"};
+        auto deletionEvents = store->findAll<Event>(Query().equal("calendarId", calendarId).equal("icsuid", deletionChunk));
+        for (auto & e : deletionEvents) store->remove(e.get());
+        transaction.commit();
     }
 }
 

@@ -39,6 +39,9 @@ public:
     string ctag();
     void setCtag(string ctag);
 
+    long long lastEventReconciliation();
+    void setLastEventReconciliation(long long timestamp);
+
     string syncToken();
     void setSyncToken(string token);
 

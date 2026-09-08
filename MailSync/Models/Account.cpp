@@ -147,10 +147,25 @@ string Account::CalDAVHost() {
 
 string Account::CardDAVHost() {
     json & s = _data["settings"];
-    if (s.count("carddav_host") && !s["carddav_host"].get<string>().empty()) {
-        return s["carddav_host"].get<string>();
+    string host = s.count("carddav_host") && !s["carddav_host"].get<string>().empty()
+        ? s["carddav_host"].get<string>()
+        : CalDAVHost();
+    // SmarterMail publishes contacts and calendars beneath sibling WebDAV
+    // endpoints. Older SummerMail accounts only stored the CalDAV URL, so
+    // derive the CardDAV endpoint while retaining the same credentials.
+    if (provider() == "smartermail" && !host.empty()) {
+        const string calSuffix = "/cal/";
+        size_t calPos = host.find(calSuffix);
+        if (calPos != string::npos) {
+            host.replace(calPos, calSuffix.size(), "/ab/");
+        } else {
+            while (!host.empty() && host.back() == '/') host.pop_back();
+            if (host.size() >= 7 && host.substr(host.size() - 7) == "/WebDAV") {
+                host += "/ab/";
+            }
+        }
     }
-    return CalDAVHost();
+    return host;
 }
 
 string Account::CalDAVUsername() {
