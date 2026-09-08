@@ -2263,6 +2263,12 @@ shared_ptr<DavXML> DAVWorker::performXMLRequest(string _url, string method, stri
     const char * payloadChars = payload.c_str();
     curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
+    // DAV deployments commonly canonicalize /WebDAV and collection URLs with
+    // 301/302 redirects. Follow a small number of HTTPS-only redirects. Curl
+    // deliberately does not forward Authorization to a different host.
+    curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl_handle, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
     curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
     curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);
