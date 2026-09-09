@@ -10,6 +10,7 @@
 //
 
 #include "DAVWorker.hpp"
+#include "CardDAVDiscoveryPolicy.hpp"
 #include "CalendarSyncPolicy.hpp"
 #include "DAVUtils.hpp"
 #include "ContactGroup.hpp"
@@ -25,6 +26,8 @@
 #include "NetworkRequestUtils.hpp"
 #include "icalendar.h"
 
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <set>
 #include <curl/curl.h>
@@ -616,14 +619,21 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
         string domain = account->emailAddress().substr(account->emailAddress().find("@") + 1);
         string imapHost = account->IMAPHost();
         json payload = {{"domain", domain}, {"imapHost", imapHost}};
-        json result = PerformJSONRequest(CreateIdentityRequest("/api/resolve-dav-hosts", "POST", payload.dump().c_str()));
-
-        if (result.count("carddavHost")) {
-            cardHost = result["carddavHost"].get<string>();
+        try {
+            json result = PerformJSONRequest(CreateIdentityRequest("/api/resolve-dav-hosts", "POST", payload.dump().c_str()));
+            if (result.count("carddavHost")) {
+                cardHost = result["carddavHost"].get<string>();
+            }
+        } catch (const SyncException & e) {
+            logger->warn("CardDAV host lookup failed ({}); falling back to standard discovery", e.key);
         }
 
         if (cardHost == "") {
-            // No luck.
+            // Hosted IMAP accounts commonly expose DAV beside the mail service,
+            // even when the email domain itself has no well-known endpoint.
+            cardHost = imapHost.empty() ? domain : imapHost;
+        }
+        if (cardHost == "") {
             return existing;
         }
 
@@ -635,7 +645,7 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
             if (cardRoot == "" || cardRoot.find("/.well-known") != string::npos) {
                 // if we couldn't find the root or the redirect looks like it was sending us in a circle,
                 // (or redirecting us to https://) fall back to the root.
-                cardRoot = cardHost + "/";
+                cardRoot = "https://" + cardHost + "/";
             }
         }
     }
@@ -662,23 +672,50 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
     // Hit the home address book set to retrieve the individual address books (including ctag)
     auto abSetContentsDoc = performXMLRequest(abSetURL, "PROPFIND", "<?xml version=\"1.0\" encoding=\"UTF-8\"?><d:propfind xmlns:d=\"DAV:\" xmlns:cs=\"http://calendarserver.org/ns/\"><d:prop><d:resourcetype /><d:displayname /><cs:getctag /></d:prop></d:propfind>");
 
-    // Iterate over the address books and run a sync on each one
-    // TODO: Pick the primary one somehow!
-
+    struct AddressBookCandidate {
+        string url;
+        string ctag;
+        string displayName;
+        int preference;
+    };
+    vector<AddressBookCandidate> candidates;
     abSetContentsDoc->evaluateXPath("//D:response[.//carddav:addressbook]", ([&](xmlNodePtr node) {
         string abHREF = abSetContentsDoc->nodeContentAtXPath(".//D:href/text()", node);
         string abURL = (abHREF.find("://") == string::npos) ? replacePath(abSetURL, abHREF) : abHREF;
         string ctag = abSetContentsDoc->nodeContentAtXPath(".//cs:getctag/text()", node);
-        if (!existing) {
-            existing = make_shared<ContactBook>(account->id() + "-default", account->id());
-        }
-        existing->setSource("carddav");
-        existing->setURL(abURL);
-        // Save without ctag - ctag is only persisted after a successful sync.
-        // (Setting it here would cause the first sync to see oldCtag == newCtag and skip.)
-        store->save(existing.get());
-        existing->setCtag(ctag); // set in-memory for comparison, not yet in DB
+        string displayName = abSetContentsDoc->nodeContentAtXPath(".//D:displayname/text()", node);
+        candidates.push_back({
+            abURL,
+            ctag,
+            displayName,
+            CardDAVDiscoveryPolicy::addressBookPreference(displayName, abURL)
+        });
     }));
+
+    if (candidates.empty()) {
+        return existing;
+    }
+
+    auto selected = max_element(
+        candidates.begin(),
+        candidates.end(),
+        [](const AddressBookCandidate & a, const AddressBookCandidate & b) {
+            return a.preference < b.preference;
+        }
+    );
+    if (!existing) {
+        existing = make_shared<ContactBook>(account->id() + "-default", account->id());
+    }
+    existing->setSource("carddav");
+    existing->setURL(selected->url);
+    // Save without the newly discovered ctag so the first pass cannot skip.
+    store->save(existing.get());
+    existing->setCtag(selected->ctag);
+    logger->info(
+        "Selected personal CardDAV address book '{}' from {} candidate(s)",
+        selected->displayName,
+        candidates.size()
+    );
 
     return existing;
 }

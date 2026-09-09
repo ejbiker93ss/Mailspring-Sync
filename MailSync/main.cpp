@@ -777,6 +777,35 @@ void runListenOnMainThread(shared_ptr<Account> account) {
                 }
             }
 
+            if (type == "sync-contacts") {
+                static atomic<bool> runningContactsSync { false };
+                bool expected = false;
+                if (runningContactsSync.compare_exchange_strong(expected, true)) {
+                    std::thread([account]() {
+                        SetThreadName("contacts");
+                        try {
+                            auto worker = DAVWorker(account);
+                            worker.runContacts();
+                        } catch (SyncException & ex) {
+                            spdlog::get("logger")->warn(
+                                "Manual contact sync failed ({}); mail sync will continue",
+                                ex.key
+                            );
+                        } catch (std::exception & ex) {
+                            spdlog::get("logger")->warn(
+                                "Manual contact sync failed ({}); mail sync will continue",
+                                ex.what()
+                            );
+                        } catch (...) {
+                            spdlog::get("logger")->warn(
+                                "Manual contact sync failed; mail sync will continue"
+                            );
+                        }
+                        runningContactsSync = false;
+                    }).detach();
+                }
+            }
+
             if (type == "test-crash") {
                 throw SyncException("test", "triggered via cin", false);
             }
