@@ -474,7 +474,7 @@ void DAVWorker::runContacts() {
             // These indicate the CardDAV server is unreachable - skip contact sync rather than crashing.
             if (e.isOffline()) {
                 logger->info("CardDAV server unreachable during discovery ({}), skipping contact sync", e.key);
-                contactsDiscoveryComplete = true;
+                contactsDiscoveryComplete = false;
                 cachedAddressBook = nullptr;
                 return;
             }
@@ -501,10 +501,14 @@ void DAVWorker::runContacts() {
     string newCtag = cachedAddressBook->ctag();
 
     // Compare old ctag with new ctag from server
-    if (oldCtag == newCtag && newCtag != "") {
+    const bool needsVerifiedListing = !cachedAddressBook->hasVerifiedListing();
+    if (!needsVerifiedListing && oldCtag == newCtag && newCtag != "") {
         logger->info("Address book unchanged (ctag: {}), skipping sync", newCtag);
         return;
     }
+    // Token recovery may save this model before contact ingestion finishes.
+    // Keep the last completed ctag until every requested contact is stored.
+    cachedAddressBook->setCtag(oldCtag);
 
     if (newCtag != "") {
         logger->info("Syncing address book (ctag: {} -> {})", oldCtag, newCtag);
@@ -516,17 +520,20 @@ void DAVWorker::runContacts() {
     // This fallback handles servers that don't support sync-collection (Robur, GMX),
     // return errors instead of graceful decline (Zimbra, Posteo), or have unreliable
     // implementations (Synology, DAViCal, Bedework). See function comments for details.
-    bool usedSyncToken = runForAddressBookWithSyncToken(cachedAddressBook);
+    bool usedSyncToken = !needsVerifiedListing && runForAddressBookWithSyncToken(cachedAddressBook);
     if (!usedSyncToken) {
         runForAddressBook(cachedAddressBook);
+        // Tokens from the old/unsupported query must not skip the repaired snapshot.
+        cachedAddressBook->setSyncToken("");
+        cachedAddressBook->setVerifiedListing(true);
     }
 
     // Persist ctag after successful sync (mirrors calendar behavior).
     // On the first sync the DB record has no ctag yet, so we save it now.
     if (newCtag != "") {
         cachedAddressBook->setCtag(newCtag);
-        store->save(cachedAddressBook.get());
     }
+    store->save(cachedAddressBook.get());
 }
 
 /*
@@ -707,6 +714,11 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
         existing = make_shared<ContactBook>(account->id() + "-default", account->id());
     }
     existing->setSource("carddav");
+    if (existing->url() != selected->url) {
+        existing->setCtag("");
+        existing->setSyncToken("");
+        existing->setVerifiedListing(false);
+    }
     existing->setURL(selected->url);
     // Save without the newly discovered ctag so the first pass cannot skip.
     store->save(existing.get());
@@ -951,16 +963,30 @@ void DAVWorker::runForAddressBook(shared_ptr<ContactBook> ab) {
     map<ETAG, string> remote {};
 
     {
-        // RFC 6352 requires the filter element even when every card should
-        // match. SmarterMail rejects the previously abbreviated query with
-        // HTTP 400, while more permissive CardDAV servers happened to accept it.
-        auto etagsDoc = performXMLRequest(ab->url(), "REPORT", "<c:addressbook-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><d:getetag /></d:prop><c:filter /></c:addressbook-query>");
+        // SmarterMail returns an empty successful addressbook-query for an empty
+        // filter even when cards exist. Depth-one PROPFIND enumerates their ETags
+        // without downloading card bodies and is also valid for an empty book.
+        auto etagsDoc = performXMLRequest(ab->url(), "PROPFIND", "<d:propfind xmlns:d=\"DAV:\"><d:prop><d:getetag/><d:resourcetype/></d:prop></d:propfind>", "1");
 
-        etagsDoc->evaluateXPath("//D:response", ([&](xmlNodePtr node) {
-            auto etag = etagsDoc->nodeContentAtXPath(".//D:getetag/text()", node);
-            auto href = etagsDoc->nodeContentAtXPath(".//D:href/text()", node);
+        int responses = 0;
+        etagsDoc->evaluateXPath("/D:multistatus/D:response", ([&](xmlNodePtr node) {
+            responses++;
+            auto href = etagsDoc->nodeContentAtXPath("./D:href/text()", node);
+            auto status = etagsDoc->nodeContentAtXPath("./D:status/text()", node);
+            if (!status.empty() && status.find("200") == string::npos) {
+                throw SyncException("incomplete-contact-listing", "DAV listing contains a failed resource", false);
+            }
+            if (normalizeHref(href) == normalizeHref(ab->url())) return;
+            bool collection = false;
+            etagsDoc->evaluateXPath(".//D:collection", [&](xmlNodePtr) { collection = true; }, node);
+            if (collection) return;
+            auto etag = etagsDoc->nodeContentAtXPath("./D:propstat[contains(D:status, '200')]/D:prop/D:getetag/text()", node);
+            if (href.empty() || etag.empty()) {
+                throw SyncException("incomplete-contact-listing", "DAV listing omitted a resource href or ETag", false);
+            }
             remote[string(etag.c_str())] = string(href.c_str());
         }));
+        if (!responses) throw SyncException("incomplete-contact-listing", "DAV listing contained no collection response", false);
     }
     
 
@@ -1039,16 +1065,13 @@ void DAVWorker::runForAddressBook(shared_ptr<ContactBook> ab) {
         if (responsesFound == 0 && !chunk.empty()) {
             logger->warn("Multiget for {} hrefs returned 0 D:response nodes - server response may be malformed or empty", chunk.size());
         }
+        if (parsed.size() != chunk.size()) {
+            throw SyncException("incomplete-contact-multiget", "DAV did not return every requested contact; sync state was not advanced", false);
+        }
 
-        // Phase 2: Insert/update contacts and process deletions within the same transaction.
-        // Most of the time, this results in a contact being replaced within a single transaction.
+        // Phase 2: Save this validated batch. Deletions wait for all batches.
         {
             MailStoreTransaction transaction{store, "runForAddressBook"};
-
-            if (deleted.size()) {
-                ingestContactDeletions(ab, deleted);
-                deleted.clear();
-            }
 
             for (auto & p : parsed) {
                 auto contact = store->find<Contact>(Query().equal("id", p.id));
@@ -1071,7 +1094,7 @@ void DAVWorker::runForAddressBook(shared_ptr<ContactBook> ab) {
         }
     }
 
-    // Process any remaining deletions if there were no multiget chunks to piggyback on
+    // Only prune after every requested card was returned and parsed successfully.
     if (deleted.size()) {
         MailStoreTransaction transaction{store, "runForAddressBook:deletions"};
         ingestContactDeletions(ab, deleted);
@@ -1192,6 +1215,10 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
 
         // Extract new sync-token from response
         string newSyncToken = syncDoc->nodeContentAtXPath("//D:sync-token/text()");
+        if (newSyncToken.empty()) {
+            logger->info("Contact sync response omitted sync-token; using verified ETag listing");
+            return false;
+        }
 
         // Check for 507 (Insufficient Storage) status indicating truncated results
         // RFC 6578 section 3.6: server returns 507 when it can't return all results
@@ -1220,6 +1247,9 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
                     // Have full data (incremental sync response) - process directly
                     bool isGroup = false;
                     auto contact = ingestAddressDataNode(syncDoc, node, isGroup);
+                    if (!contact) {
+                        throw SyncException("incomplete-contact-sync", "Unable to parse changed contact; sync state was not advanced", false);
+                    }
                     if (contact) {
                         contact->setBookId(ab->id());
                         if (isGroup) {
@@ -1241,15 +1271,14 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
         }
     }
 
-    if (pageCount >= maxPages) {
-        logger->warn("sync-collection hit max pages limit ({}), sync may be incomplete", maxPages);
+    if (hasMorePages) {
+        throw SyncException("incomplete-contact-sync", "Contact sync exceeded its page limit", false);
     }
 
     logger->info("sync-collection complete ({} pages) for contacts: {} needed, {} deleted",
                  pageCount, neededHrefs.size(), deletedHrefs.size());
 
     // Fetch needed items (from initial sync) using multiget in chunks
-    bool multigetHadEmptyResponse = false;
     if (!neededHrefs.empty()) {
         std::reverse(neededHrefs.begin(), neededHrefs.end());
 
@@ -1290,9 +1319,8 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
                 parsed.push_back({id, etag, href, vcardString, email, name, isGroup});
             }));
 
-            if (responsesFound == 0 && !chunk.empty()) {
-                logger->warn("Multiget for {} hrefs returned 0 D:response nodes - server response may be malformed or empty", chunk.size());
-                multigetHadEmptyResponse = true;
+            if (parsed.size() != chunk.size()) {
+                throw SyncException("incomplete-contact-multiget", "DAV did not return every requested contact; sync state was not advanced", false);
             }
 
             // Phase 2: DB operations INSIDE a short transaction
@@ -1354,18 +1382,11 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
         store->save(contact.get());
     }
 
-    // Store final sync-token for next sync.
-    // Do NOT advance the token if the multiget returned 0 D:response nodes for requested hrefs.
-    // That indicates a server-side anomaly (empty response), and storing the token would permanently
-    // skip those contacts since future incremental syncs would not re-request them.
+    // Reached only after all requested cards have been returned and parsed.
     if (syncToken != "" && syncToken != ab->syncToken()) {
-        if (multigetHadEmptyResponse) {
-            logger->warn("Not storing sync-token because multiget returned empty responses - will retry contacts on next sync");
-        } else {
-            ab->setSyncToken(syncToken);
-            store->save(ab.get());
-            logger->info("Stored new sync-token for address book");
-        }
+        ab->setSyncToken(syncToken);
+        store->save(ab.get());
+        logger->info("Stored new sync-token for address book");
     }
 
     return true;

@@ -43,6 +43,8 @@ public:
 
     string syncToken();
     void setSyncToken(string token);
+    bool hasVerifiedListing();
+    void setVerifiedListing(bool verified);
 
     string tableName();
     string constructorName();

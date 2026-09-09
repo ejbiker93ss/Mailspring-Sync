@@ -136,7 +136,7 @@ const option::Descriptor usage[] =
     {HELP,    0,"" , "help",    CArg::None,      "  --help  \tPrint usage and exit." },
     {IDENTITY,0,"a", "identity",CArg::Optional,  USAGE_IDENTITY },
     {ACCOUNT, 0,"a", "account", CArg::Optional,  "  --account, -a  \tRequired: Account JSON with credentials." },
-    {MODE,    0,"m", "mode",    CArg::Required,  "  --mode, -m  \tRequired: sync, test, reset, calendar, migrate, or install-check." },
+    {MODE,    0,"m", "mode",    CArg::Required,  "  --mode, -m  \tRequired: sync, contacts, test, reset, calendar, migrate, or install-check." },
     {ORPHAN,  0,"o", "orphan",  CArg::None,      "  --orphan, -o  \tOptional: allow the process to run without a parent bound to stdin." },
     {VERBOSE, 0,"v", "verbose", CArg::None,      "  --verbose, -v  \tOptional: log all IMAP and SMTP traffic for debugging purposes." },
     {0,0,0,0,0,0}
@@ -990,6 +990,13 @@ string exectuablePath = argv[0];
 
     if (mode == "test") {
         return runTestAuth(account);
+    }
+
+    if (mode == "contacts") {
+        return runSingleFunctionAndExit([&]() {
+            DAVWorker worker(account);
+            worker.runContacts();
+        });
     }
 
     if (mode == "sync") {

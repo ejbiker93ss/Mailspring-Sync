@@ -71,6 +71,14 @@ void ContactBook::setSyncToken(string token) {
     _data["syncToken"] = token;
 }
 
+bool ContactBook::hasVerifiedListing() {
+    return _data.value("verifiedListingVersion", 0) >= 1;
+}
+
+void ContactBook::setVerifiedListing(bool verified) {
+    _data["verifiedListingVersion"] = verified ? 1 : 0;
+}
+
 vector<string> ContactBook::columnsForQuery() {
     return vector<string>{"id", "accountId", "version", "data"};
 }
