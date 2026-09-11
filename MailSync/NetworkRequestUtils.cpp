@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "Identity.hpp"
@@ -56,7 +56,7 @@ size_t _onAppendToString(void *contents, size_t length, size_t nmemb, void *user
     return real_size;
 }
 
-const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken) {
+const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken, bool useMicrosoftGraph) {
     CURL * curl_handle = curl_easy_init();
     const char * url =
           provider == "gmail" ? "https://www.googleapis.com/oauth2/v4/token"
@@ -72,7 +72,9 @@ const json MakeOAuthRefreshRequest(string provider, string clientId, string refr
     curl_free(c);
     curl_free(r);
 
-    if (provider == "office365" || provider == "outlook") {
+    if (useMicrosoftGraph) {
+        payload += "&scope=https%3A%2F%2Fgraph.microsoft.com%2FMail.ReadWrite%20https%3A%2F%2Fgraph.microsoft.com%2FMail.ReadWrite.Shared%20https%3A%2F%2Fgraph.microsoft.com%2FMail.Send%20https%3A%2F%2Fgraph.microsoft.com%2FMail.Send.Shared%20https%3A%2F%2Fgraph.microsoft.com%2FUser.Read%20offline_access";
+    } else if (provider == "office365" || provider == "outlook") {
         // workaround the fact that Microsoft's OAUTH flow allows you to authorize many scopes, but you
         // have to get a separate token for outlook (email + IMAP) and contacts / calendar / Microsoft Graph APIs
         // separately. The same refresh token will give you access tokens, but the access tokens are different.
@@ -81,12 +83,26 @@ const json MakeOAuthRefreshRequest(string provider, string clientId, string refr
 
     string gmailClientId = MailUtils::getEnvUTF8("GMAIL_CLIENT_ID");
     string gmailClientSecret = MailUtils::getEnvUTF8("GMAIL_CLIENT_SECRET");
-    if (provider == "gmail" && clientId == gmailClientId) {
+    string legacyGmailClientId = MailUtils::getEnvUTF8("LEGACY_GMAIL_CLIENT_ID");
+    string legacyGmailClientSecret = MailUtils::getEnvUTF8("LEGACY_GMAIL_CLIENT_SECRET");
+    if (provider == "gmail" && clientId == gmailClientId && gmailClientSecret != "") {
         // per https://stackoverflow.com/questions/59416326/safely-distribute-oauth-2-0-client-secret-in-desktop-applications-in-python,
         // we really do need to embed this in the application and it's more an extension of the Client ID than a proper Client Secret.
-        // For a full explanation, see onboarding-helpers.ts in Mailspring. Please don't re-use this client id + secret in derivative
+        // For a full explanation, see onboarding-helpers.ts in SummerMail. Please don't re-use this client id + secret in derivative
         // works or other products.
-        payload += "&client_secret=" + gmailClientSecret;
+        char * secret = curl_easy_escape(curl_handle, gmailClientSecret.c_str(), 0);
+        if (secret != nullptr) {
+            payload += "&client_secret=" + string(secret);
+            curl_free(secret);
+        }
+    } else if (provider == "gmail" && clientId == legacyGmailClientId && legacyGmailClientSecret != "") {
+        // Refresh tokens remain bound to the OAuth client that issued them.
+        // This path keeps pre-SummerMail Gmail accounts working after migration.
+        char * secret = curl_easy_escape(curl_handle, legacyGmailClientSecret.c_str(), 0);
+        if (secret != nullptr) {
+            payload += "&client_secret=" + string(secret);
+            curl_free(secret);
+        }
     }
 
     // Store headers in CurlRequestData for proper cleanup
@@ -124,6 +140,42 @@ CURL * CreateJSONRequest(string url, string method, string authorization, const 
     curl_easy_setopt(curl_handle, CURLOPT_PRIVATE, requestData);
 
     return curl_handle;
+}
+
+CURL * CreateMicrosoftGraphRequest(string url, string method, string accessToken, const char * payloadChars) {
+    CURL * request = CreateJSONRequest(url, method, "Bearer " + accessToken, payloadChars);
+    CurlRequestData *data = nullptr;
+    curl_easy_getinfo(request, CURLINFO_PRIVATE, &data);
+    if (data != nullptr) {
+        data->headers = curl_slist_append(data->headers, "Prefer: IdType=\"ImmutableId\"");
+        curl_easy_setopt(request, CURLOPT_HTTPHEADER, data->headers);
+    }
+    return request;
+}
+
+CURL * CreateMicrosoftGraphMimeRequest(string url, string accessToken, const string & base64Mime) {
+    CURL * request = CreateJSONRequest(url, "POST", "Bearer " + accessToken, nullptr);
+    CurlRequestData *data = nullptr;
+    curl_easy_getinfo(request, CURLINFO_PRIVATE, &data);
+    if (data != nullptr) {
+        data->headers = curl_slist_append(data->headers, "Content-Type: text/plain");
+        data->headers = curl_slist_append(data->headers, "Prefer: IdType=\"ImmutableId\"");
+        curl_easy_setopt(request, CURLOPT_HTTPHEADER, data->headers);
+    }
+    curl_easy_setopt(request, CURLOPT_POSTFIELDS, base64Mime.c_str());
+    curl_easy_setopt(request, CURLOPT_POSTFIELDSIZE, (long)base64Mime.size());
+    return request;
+}
+
+string MicrosoftGraphBaseURL(shared_ptr<Account> account) {
+    string mailbox = account->graphMailbox();
+    if (mailbox.empty()) return "https://graph.microsoft.com/v1.0/me";
+    CURL *curl = curl_easy_init();
+    char *encoded = curl_easy_escape(curl, mailbox.c_str(), (int)mailbox.size());
+    string result = "https://graph.microsoft.com/v1.0/users/" + string(encoded ? encoded : "");
+    if (encoded) curl_free(encoded);
+    curl_easy_cleanup(curl);
+    return result;
 }
 
 const string PerformRequest(CURL * curl_handle) {

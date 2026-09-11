@@ -6,10 +6,12 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "DAVWorker.hpp"
+#include "CardDAVDiscoveryPolicy.hpp"
+#include "CalendarSyncPolicy.hpp"
 #include "DAVUtils.hpp"
 #include "ContactGroup.hpp"
 #include "MailStore.hpp"
@@ -24,6 +26,8 @@
 #include "NetworkRequestUtils.hpp"
 #include "icalendar.h"
 
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <set>
 #include <curl/curl.h>
@@ -118,6 +122,11 @@ struct ParsedContact {
     string name;
     bool isGroup;
 };
+
+static string firstVCardEmail(const shared_ptr<VCard>& vcard) {
+    auto emails = vcard->getEmails();
+    return emails.empty() ? "" : emails.front()->getValue();
+}
 
 struct ParsedCalEvent {
     string etag;
@@ -413,7 +422,24 @@ DAVWorker::DAVWorker(shared_ptr<Account> account) :
 }
 
 void DAVWorker::run() {
-    runContacts();
+    try {
+        runContacts();
+    } catch (SyncException & ex) {
+        // CardDAV and CalDAV share this worker but are independent services.
+        // A broken address book (notably SmarterMail's GAL returning 400) must
+        // not prevent calendar discovery and event sync from running.
+        logger->warn(
+            "CardDAV sync failed ({}); continuing with CalDAV",
+            ex.key
+        );
+    } catch (std::exception & ex) {
+        logger->warn(
+            "CardDAV sync failed ({}); continuing with CalDAV",
+            ex.what()
+        );
+    } catch (...) {
+        logger->warn("CardDAV sync failed; continuing with CalDAV");
+    }
     runCalendars();
 }
 
@@ -448,7 +474,7 @@ void DAVWorker::runContacts() {
             // These indicate the CardDAV server is unreachable - skip contact sync rather than crashing.
             if (e.isOffline()) {
                 logger->info("CardDAV server unreachable during discovery ({}), skipping contact sync", e.key);
-                contactsDiscoveryComplete = true;
+                contactsDiscoveryComplete = false;
                 cachedAddressBook = nullptr;
                 return;
             }
@@ -475,10 +501,14 @@ void DAVWorker::runContacts() {
     string newCtag = cachedAddressBook->ctag();
 
     // Compare old ctag with new ctag from server
-    if (oldCtag == newCtag && newCtag != "") {
+    const bool needsVerifiedListing = !cachedAddressBook->hasVerifiedListing();
+    if (!needsVerifiedListing && oldCtag == newCtag && newCtag != "") {
         logger->info("Address book unchanged (ctag: {}), skipping sync", newCtag);
         return;
     }
+    // Token recovery may save this model before contact ingestion finishes.
+    // Keep the last completed ctag until every requested contact is stored.
+    cachedAddressBook->setCtag(oldCtag);
 
     if (newCtag != "") {
         logger->info("Syncing address book (ctag: {} -> {})", oldCtag, newCtag);
@@ -490,17 +520,20 @@ void DAVWorker::runContacts() {
     // This fallback handles servers that don't support sync-collection (Robur, GMX),
     // return errors instead of graceful decline (Zimbra, Posteo), or have unreliable
     // implementations (Synology, DAViCal, Bedework). See function comments for details.
-    bool usedSyncToken = runForAddressBookWithSyncToken(cachedAddressBook);
+    bool usedSyncToken = !needsVerifiedListing && runForAddressBookWithSyncToken(cachedAddressBook);
     if (!usedSyncToken) {
         runForAddressBook(cachedAddressBook);
+        // Tokens from the old/unsupported query must not skip the repaired snapshot.
+        cachedAddressBook->setSyncToken("");
+        cachedAddressBook->setVerifiedListing(true);
     }
 
     // Persist ctag after successful sync (mirrors calendar behavior).
     // On the first sync the DB record has no ctag yet, so we save it now.
     if (newCtag != "") {
         cachedAddressBook->setCtag(newCtag);
-        store->save(cachedAddressBook.get());
     }
+    store->save(cachedAddressBook.get());
 }
 
 /*
@@ -577,34 +610,50 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
     }
     
     string cardHost = "";
+    string configuredHost = account->CardDAVHost();
     
     // Try to use DNS SRV records to find the principal URL. We do this through a server API so that
     // we don't have to compile C++ that does DNS lookups. On Win it's a pain and on Linux it generates
     // a binary that is bound to a specific version of glibc which generates relocation errors when
     // run on Ubuntu 18.
-    string domain = account->emailAddress().substr(account->emailAddress().find("@") + 1);
-    string imapHost = account->IMAPHost();
-    json payload = {{"domain", domain}, {"imapHost", imapHost}};
-    json result = PerformJSONRequest(CreateIdentityRequest("/api/resolve-dav-hosts", "POST", payload.dump().c_str()));
-    
-    if (result.count("carddavHost")) {
-        cardHost = result["carddavHost"].get<string>();
-    }
-    
-    if (cardHost == "") {
-        // No luck.
-        return existing;
-    }
+    string cardRoot = "";
+    if (configuredHost != "") {
+        cardRoot = configuredHost.find("http") == 0
+            ? configuredHost
+            : "https://" + configuredHost;
+        if (cardRoot.back() != '/') cardRoot += "/";
+    } else {
+        string domain = account->emailAddress().substr(account->emailAddress().find("@") + 1);
+        string imapHost = account->IMAPHost();
+        json payload = {{"domain", domain}, {"imapHost", imapHost}};
+        try {
+            json result = PerformJSONRequest(CreateIdentityRequest("/api/resolve-dav-hosts", "POST", payload.dump().c_str()));
+            if (result.count("carddavHost")) {
+                cardHost = result["carddavHost"].get<string>();
+            }
+        } catch (const SyncException & e) {
+            logger->warn("CardDAV host lookup failed ({}); falling back to standard discovery", e.key);
+        }
 
-    // Use the .well-known convention to try to look up the root path of the carddav service at the host. If this doesn't
-    // work, that's fine with us, we just try the root.
-    string cardRoot = PerformExpectedRedirect("https://" + cardHost + "/.well-known/carddav");
-    if (cardRoot == "") {
-        cardRoot = PerformExpectedRedirect("http://" + cardHost + "/.well-known/carddav");
-        if (cardRoot == "" || cardRoot.find("/.well-known") != string::npos) {
-            // if we couldn't find the root or the redirect looks like it was sending us in a circle,
-            // (or redirecting us to https://) fall back to the root.
-            cardRoot = cardHost + "/";
+        if (cardHost == "") {
+            // Hosted IMAP accounts commonly expose DAV beside the mail service,
+            // even when the email domain itself has no well-known endpoint.
+            cardHost = imapHost.empty() ? domain : imapHost;
+        }
+        if (cardHost == "") {
+            return existing;
+        }
+
+        // Use the .well-known convention to try to look up the root path of the carddav service at the host. If this doesn't
+        // work, that's fine with us, we just try the root.
+        cardRoot = PerformExpectedRedirect("https://" + cardHost + "/.well-known/carddav");
+        if (cardRoot == "") {
+            cardRoot = PerformExpectedRedirect("http://" + cardHost + "/.well-known/carddav");
+            if (cardRoot == "" || cardRoot.find("/.well-known") != string::npos) {
+                // if we couldn't find the root or the redirect looks like it was sending us in a circle,
+                // (or redirecting us to https://) fall back to the root.
+                cardRoot = "https://" + cardHost + "/";
+            }
         }
     }
     
@@ -630,23 +679,55 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
     // Hit the home address book set to retrieve the individual address books (including ctag)
     auto abSetContentsDoc = performXMLRequest(abSetURL, "PROPFIND", "<?xml version=\"1.0\" encoding=\"UTF-8\"?><d:propfind xmlns:d=\"DAV:\" xmlns:cs=\"http://calendarserver.org/ns/\"><d:prop><d:resourcetype /><d:displayname /><cs:getctag /></d:prop></d:propfind>");
 
-    // Iterate over the address books and run a sync on each one
-    // TODO: Pick the primary one somehow!
-
+    struct AddressBookCandidate {
+        string url;
+        string ctag;
+        string displayName;
+        int preference;
+    };
+    vector<AddressBookCandidate> candidates;
     abSetContentsDoc->evaluateXPath("//D:response[.//carddav:addressbook]", ([&](xmlNodePtr node) {
         string abHREF = abSetContentsDoc->nodeContentAtXPath(".//D:href/text()", node);
         string abURL = (abHREF.find("://") == string::npos) ? replacePath(abSetURL, abHREF) : abHREF;
         string ctag = abSetContentsDoc->nodeContentAtXPath(".//cs:getctag/text()", node);
-        if (!existing) {
-            existing = make_shared<ContactBook>(account->id() + "-default", account->id());
-        }
-        existing->setSource("carddav");
-        existing->setURL(abURL);
-        // Save without ctag - ctag is only persisted after a successful sync.
-        // (Setting it here would cause the first sync to see oldCtag == newCtag and skip.)
-        store->save(existing.get());
-        existing->setCtag(ctag); // set in-memory for comparison, not yet in DB
+        string displayName = abSetContentsDoc->nodeContentAtXPath(".//D:displayname/text()", node);
+        candidates.push_back({
+            abURL,
+            ctag,
+            displayName,
+            CardDAVDiscoveryPolicy::addressBookPreference(displayName, abURL)
+        });
     }));
+
+    if (candidates.empty()) {
+        return existing;
+    }
+
+    auto selected = max_element(
+        candidates.begin(),
+        candidates.end(),
+        [](const AddressBookCandidate & a, const AddressBookCandidate & b) {
+            return a.preference < b.preference;
+        }
+    );
+    if (!existing) {
+        existing = make_shared<ContactBook>(account->id() + "-default", account->id());
+    }
+    existing->setSource("carddav");
+    if (existing->url() != selected->url) {
+        existing->setCtag("");
+        existing->setSyncToken("");
+        existing->setVerifiedListing(false);
+    }
+    existing->setURL(selected->url);
+    // Save without the newly discovered ctag so the first pass cannot skip.
+    store->save(existing.get());
+    existing->setCtag(selected->ctag);
+    logger->info(
+        "Selected personal CardDAV address book '{}' from {} candidate(s)",
+        selected->displayName,
+        candidates.size()
+    );
 
     return existing;
 }
@@ -659,41 +740,89 @@ shared_ptr<ContactBook> DAVWorker::resolveAddressBook() {
  Throws SyncException on transient errors; caller handles.
 */
 string DAVWorker::resolveCalendarHomeURL() {
-    string domain = account->emailAddress().substr(account->emailAddress().find("@") + 1);
-    string imapHost = account->IMAPHost();
-    json payload = {{"domain", domain}, {"imapHost", imapHost}};
-    json result = PerformJSONRequest(
-        CreateIdentityRequest("/api/resolve-dav-hosts", "POST", payload.dump().c_str())
-    );
-
+    string email = account->emailAddress();
+    size_t at = email.find("@");
+    string domain = at == string::npos ? "" : email.substr(at + 1);
+    string configuredHost = account->CalDAVHost();
     string caldavHost = "";
-    if (result.count("caldavHost")) {
-        caldavHost = result["caldavHost"].get<string>();
+
+    // A manually configured URL wins. This lets every account type use a
+    // calendar service that is separate from its IMAP provider.
+    if (configuredHost != "") {
+        string calRoot = configuredHost.find("http") == 0
+            ? configuredHost
+            : "https://" + configuredHost;
+        if (calRoot.back() != '/') calRoot += "/";
+        caldavHost = calRoot;
+    } else {
+        // The identity service knows about providers whose CalDAV host cannot
+        // be inferred from the email domain (for example hosted/custom domains).
+        // Calendar discovery must not depend on that service being available,
+        // though: RFC 6764 defines https://<email-domain>/.well-known/caldav.
+        try {
+            string imapHost = account->IMAPHost();
+            json payload = {{"domain", domain}, {"imapHost", imapHost}};
+            json result = PerformJSONRequest(
+                CreateIdentityRequest("/api/resolve-dav-hosts", "POST", payload.dump().c_str())
+            );
+            if (result.count("caldavHost")) {
+                caldavHost = result["caldavHost"].get<string>();
+            }
+        } catch (const SyncException & e) {
+            logger->warn("CalDAV host lookup failed ({}); falling back to standard discovery", e.key);
+        }
+
+        if (caldavHost == "") {
+            caldavHost = domain;
+        }
     }
     if (caldavHost == "") {
         return "";
     }
 
-    // .well-known/caldav redirect to find service root
-    string calRoot = PerformExpectedRedirect("https://" + caldavHost + "/.well-known/caldav");
-    if (calRoot == "") {
-        calRoot = PerformExpectedRedirect("http://" + caldavHost + "/.well-known/caldav");
-    }
-    if (calRoot == "" || calRoot.find("/.well-known") != string::npos) {
-        // Include scheme so that replacePath() and performXMLRequest() receive a
-        // consistent full URL regardless of which branch was taken above.
-        calRoot = "https://" + caldavHost + "/";
+    string calRoot;
+    if (configuredHost != "") {
+        // Explicit values may include a non-standard service path. Start there
+        // rather than discarding it and forcing /.well-known/caldav.
+        calRoot = caldavHost;
+    } else {
+        // .well-known/caldav redirect to find service root
+        calRoot = PerformExpectedRedirect("https://" + caldavHost + "/.well-known/caldav");
+        if (calRoot == "") {
+            calRoot = PerformExpectedRedirect("http://" + caldavHost + "/.well-known/caldav");
+        }
+        if (calRoot == "" || calRoot.find("/.well-known") != string::npos) {
+            // Include scheme so that replacePath() and performXMLRequest() receive a
+            // consistent full URL regardless of which branch was taken above.
+            calRoot = "https://" + caldavHost + "/";
+        }
     }
 
     // PROPFIND root → current-user-principal (RFC 5397)
     auto principalDoc = performXMLRequest(calRoot, "PROPFIND",
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-        "<A:propfind xmlns:A=\"DAV:\"><A:prop>"
-        "<A:current-user-principal/><A:principal-URL/><A:resourcetype/>"
+        "<A:propfind xmlns:A=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><A:prop>"
+        "<A:current-user-principal/><A:principal-URL/><A:resourcetype/><C:calendar-home-set/>"
         "</A:prop></A:propfind>");
     string calPrincipalURL = principalDoc->nodeContentAtXPath("//D:current-user-principal/D:href/text()");
     if (calPrincipalURL.empty()) {
-        logger->info("CalDAV: server returned no current-user-principal, skipping calendar discovery");
+        // Some servers allow discovery directly from a configured service URL
+        // but omit current-user-principal. Accept a returned home set, or a URL
+        // that is itself a calendar collection.
+        string directHomeSet = principalDoc->nodeContentAtXPath("//caldav:calendar-home-set/D:href/text()");
+        if (!directHomeSet.empty()) {
+            return directHomeSet.find("://") == string::npos
+                ? replacePath(calRoot, directHomeSet)
+                : directHomeSet;
+        }
+        bool isCalendarCollection = false;
+        principalDoc->evaluateXPath("//D:resourcetype/caldav:calendar", ([&](xmlNodePtr) {
+            isCalendarCollection = true;
+        }));
+        if (isCalendarCollection) {
+            return calRoot;
+        }
+        logger->info("CalDAV: server returned no current-user-principal or calendar home-set");
         return "";
     }
     if (calPrincipalURL.find("://") == string::npos) {
@@ -834,13 +963,30 @@ void DAVWorker::runForAddressBook(shared_ptr<ContactBook> ab) {
     map<ETAG, string> remote {};
 
     {
-        auto etagsDoc = performXMLRequest(ab->url(), "REPORT", "<c:addressbook-query xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:carddav\"><d:prop><d:getetag /></d:prop></c:addressbook-query>");
+        // SmarterMail returns an empty successful addressbook-query for an empty
+        // filter even when cards exist. Depth-one PROPFIND enumerates their ETags
+        // without downloading card bodies and is also valid for an empty book.
+        auto etagsDoc = performXMLRequest(ab->url(), "PROPFIND", "<d:propfind xmlns:d=\"DAV:\"><d:prop><d:getetag/><d:resourcetype/></d:prop></d:propfind>", "1");
 
-        etagsDoc->evaluateXPath("//D:response", ([&](xmlNodePtr node) {
-            auto etag = etagsDoc->nodeContentAtXPath(".//D:getetag/text()", node);
-            auto href = etagsDoc->nodeContentAtXPath(".//D:href/text()", node);
+        int responses = 0;
+        etagsDoc->evaluateXPath("/D:multistatus/D:response", ([&](xmlNodePtr node) {
+            responses++;
+            auto href = etagsDoc->nodeContentAtXPath("./D:href/text()", node);
+            auto status = etagsDoc->nodeContentAtXPath("./D:status/text()", node);
+            if (!status.empty() && status.find("200") == string::npos) {
+                throw SyncException("incomplete-contact-listing", "DAV listing contains a failed resource", false);
+            }
+            if (normalizeHref(href) == normalizeHref(ab->url())) return;
+            bool collection = false;
+            etagsDoc->evaluateXPath(".//D:collection", [&](xmlNodePtr) { collection = true; }, node);
+            if (collection) return;
+            auto etag = etagsDoc->nodeContentAtXPath("./D:propstat[contains(D:status, '200')]/D:prop/D:getetag/text()", node);
+            if (href.empty() || etag.empty()) {
+                throw SyncException("incomplete-contact-listing", "DAV listing omitted a resource href or ETag", false);
+            }
             remote[string(etag.c_str())] = string(href.c_str());
         }));
+        if (!responses) throw SyncException("incomplete-contact-listing", "DAV listing contained no collection response", false);
     }
     
 
@@ -909,7 +1055,7 @@ void DAVWorker::runForAddressBook(shared_ptr<ContactBook> ab) {
             }
             string id = vcard->getUniqueId()->getValue();
             if (id == "") id = MailUtils::idForCalendar(account->id(), href);
-            string email = vcard->getEmails().front()->getValue();
+            string email = firstVCardEmail(vcard);
             string name = vcard->getFormattedName()->getValue();
             if (name == "") name = vcard->getName()->getValue();
             bool isGroup = DAVUtils::isGroupCard(vcard);
@@ -919,16 +1065,13 @@ void DAVWorker::runForAddressBook(shared_ptr<ContactBook> ab) {
         if (responsesFound == 0 && !chunk.empty()) {
             logger->warn("Multiget for {} hrefs returned 0 D:response nodes - server response may be malformed or empty", chunk.size());
         }
+        if (parsed.size() != chunk.size()) {
+            throw SyncException("incomplete-contact-multiget", "DAV did not return every requested contact; sync state was not advanced", false);
+        }
 
-        // Phase 2: Insert/update contacts and process deletions within the same transaction.
-        // Most of the time, this results in a contact being replaced within a single transaction.
+        // Phase 2: Save this validated batch. Deletions wait for all batches.
         {
             MailStoreTransaction transaction{store, "runForAddressBook"};
-
-            if (deleted.size()) {
-                ingestContactDeletions(ab, deleted);
-                deleted.clear();
-            }
 
             for (auto & p : parsed) {
                 auto contact = store->find<Contact>(Query().equal("id", p.id));
@@ -951,7 +1094,7 @@ void DAVWorker::runForAddressBook(shared_ptr<ContactBook> ab) {
         }
     }
 
-    // Process any remaining deletions if there were no multiget chunks to piggyback on
+    // Only prune after every requested card was returned and parsed successfully.
     if (deleted.size()) {
         MailStoreTransaction transaction{store, "runForAddressBook:deletions"};
         ingestContactDeletions(ab, deleted);
@@ -1072,6 +1215,10 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
 
         // Extract new sync-token from response
         string newSyncToken = syncDoc->nodeContentAtXPath("//D:sync-token/text()");
+        if (newSyncToken.empty()) {
+            logger->info("Contact sync response omitted sync-token; using verified ETag listing");
+            return false;
+        }
 
         // Check for 507 (Insufficient Storage) status indicating truncated results
         // RFC 6578 section 3.6: server returns 507 when it can't return all results
@@ -1100,6 +1247,9 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
                     // Have full data (incremental sync response) - process directly
                     bool isGroup = false;
                     auto contact = ingestAddressDataNode(syncDoc, node, isGroup);
+                    if (!contact) {
+                        throw SyncException("incomplete-contact-sync", "Unable to parse changed contact; sync state was not advanced", false);
+                    }
                     if (contact) {
                         contact->setBookId(ab->id());
                         if (isGroup) {
@@ -1121,15 +1271,14 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
         }
     }
 
-    if (pageCount >= maxPages) {
-        logger->warn("sync-collection hit max pages limit ({}), sync may be incomplete", maxPages);
+    if (hasMorePages) {
+        throw SyncException("incomplete-contact-sync", "Contact sync exceeded its page limit", false);
     }
 
     logger->info("sync-collection complete ({} pages) for contacts: {} needed, {} deleted",
                  pageCount, neededHrefs.size(), deletedHrefs.size());
 
     // Fetch needed items (from initial sync) using multiget in chunks
-    bool multigetHadEmptyResponse = false;
     if (!neededHrefs.empty()) {
         std::reverse(neededHrefs.begin(), neededHrefs.end());
 
@@ -1163,16 +1312,15 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
                 }
                 string id = vcard->getUniqueId()->getValue();
                 if (id == "") id = MailUtils::idForCalendar(account->id(), href);
-                string email = vcard->getEmails().front()->getValue();
+                string email = firstVCardEmail(vcard);
                 string name = vcard->getFormattedName()->getValue();
                 if (name == "") name = vcard->getName()->getValue();
                 bool isGroup = DAVUtils::isGroupCard(vcard);
                 parsed.push_back({id, etag, href, vcardString, email, name, isGroup});
             }));
 
-            if (responsesFound == 0 && !chunk.empty()) {
-                logger->warn("Multiget for {} hrefs returned 0 D:response nodes - server response may be malformed or empty", chunk.size());
-                multigetHadEmptyResponse = true;
+            if (parsed.size() != chunk.size()) {
+                throw SyncException("incomplete-contact-multiget", "DAV did not return every requested contact; sync state was not advanced", false);
             }
 
             // Phase 2: DB operations INSIDE a short transaction
@@ -1234,18 +1382,11 @@ bool DAVWorker::runForAddressBookWithSyncToken(shared_ptr<ContactBook> ab, int r
         store->save(contact.get());
     }
 
-    // Store final sync-token for next sync.
-    // Do NOT advance the token if the multiget returned 0 D:response nodes for requested hrefs.
-    // That indicates a server-side anomaly (empty response), and storing the token would permanently
-    // skip those contacts since future incremental syncs would not re-request them.
+    // Reached only after all requested cards have been returned and parsed.
     if (syncToken != "" && syncToken != ab->syncToken()) {
-        if (multigetHadEmptyResponse) {
-            logger->warn("Not storing sync-token because multiget returned empty responses - will retry contacts on next sync");
-        } else {
-            ab->setSyncToken(syncToken);
-            store->save(ab.get());
-            logger->info("Stored new sync-token for address book");
-        }
+        ab->setSyncToken(syncToken);
+        store->save(ab.get());
+        logger->info("Stored new sync-token for address book");
     }
 
     return true;
@@ -1292,7 +1433,7 @@ shared_ptr<Contact> DAVWorker::ingestAddressDataNode(shared_ptr<DavXML> doc, xml
     }
     string id = vcard->getUniqueId()->getValue();
     if (id == "") id = MailUtils::idForCalendar(account->id(), href);
-    string email = vcard->getEmails().front()->getValue();
+    string email = firstVCardEmail(vcard);
     string name = vcard->getFormattedName()->getValue();
     if (name == "") name = vcard->getName()->getValue();
     
@@ -1426,13 +1567,23 @@ void DAVWorker::runCalendars() {
 
     auto local = store->findAllMap<Calendar>(Query().equal("accountId", account->id()), "id");
 
-    // Filter calendars by supported-calendar-component-set to only sync those with VEVENT.
-    // This is the RFC 4791 compliant way to discover event calendars, as opposed to
-    // task lists (VTODO) or journal calendars (VJOURNAL). By filtering at discovery time,
-    // we ensure our subsequent calendar-query requests with <comp-filter name="VEVENT">
-    // will succeed. See comment in runForCalendar() for details on server compatibility
-    // issues when comp-filter is omitted.
-    calendarSetDoc->evaluateXPath("//D:response[./D:propstat/D:prop/caldav:supported-calendar-component-set/caldav:comp[@name='VEVENT']]", ([&](xmlNodePtr node) {
+    // Discover calendar collections first, then use supported-calendar-component-set
+    // when the server supplies it. That property is optional in real-world responses;
+    // treating an omitted value as "no VEVENT support" hides valid calendars on a
+    // number of otherwise compatible CalDAV servers.
+    calendarSetDoc->evaluateXPath("//D:response[.//D:resourcetype/caldav:calendar or .//caldav:supported-calendar-component-set/caldav:comp[translate(@name, 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')='VEVENT']]", ([&](xmlNodePtr node) {
+        bool declaresSupportedComponents = false;
+        bool supportsEvents = false;
+        calendarSetDoc->evaluateXPath(".//caldav:supported-calendar-component-set", ([&](xmlNodePtr) {
+            declaresSupportedComponents = true;
+        }), node);
+        calendarSetDoc->evaluateXPath(".//caldav:supported-calendar-component-set/caldav:comp[translate(@name, 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')='VEVENT']", ([&](xmlNodePtr) {
+            supportsEvents = true;
+        }), node);
+        if (declaresSupportedComponents && !supportsEvents) {
+            return;
+        }
+
         // Make a few xpath queries relative to the "D:response" calendar node (using "./")
         // to retrieve the attributes we're interested in.
         auto name = calendarSetDoc->nodeContentAtXPath(".//D:displayname/text()", node);
@@ -1448,20 +1599,31 @@ void DAVWorker::runCalendars() {
         // Check for write privilege to determine read-only status
         // Use XPath to look for write elements within current-user-privilege-set
         // RFC 3744 defines <D:write/> nested within <D:privilege> elements
+        bool hasPrivilegeSet = false;
         bool hasWritePrivilege = false;
-        calendarSetDoc->evaluateXPath(".//D:current-user-privilege-set//D:write", ([&](xmlNodePtr) {
+        calendarSetDoc->evaluateXPath(".//D:current-user-privilege-set", ([&](xmlNodePtr) {
+            hasPrivilegeSet = true;
+        }), node);
+        calendarSetDoc->evaluateXPath(".//D:current-user-privilege-set//D:write | .//D:current-user-privilege-set//D:write-content", ([&](xmlNodePtr) {
             hasWritePrivilege = true;
         }), node);
-        bool readOnly = !hasWritePrivilege;
+        // ACL support is optional. If a server omits current-user-privilege-set,
+        // do not silently make every calendar read-only; a failed PUT will still
+        // surface a precise server error. An explicit privilege set without write
+        // access remains authoritative.
+        bool readOnly = hasPrivilegeSet && !hasWritePrivilege;
 
         shared_ptr<Calendar> calendar = local[id];
+        const auto now = static_cast<long long>(time(nullptr));
+        const auto lastAudit = calendar ? calendar->lastEventReconciliation() : 0;
+        const bool reconciliationDue = CalendarSyncPolicy::reconciliationDue(lastAudit, now);
         bool needsSync = true;
         bool metadataChanged = false;
 
         // upsert the Calendar object
         if (calendar) {
             // Existing calendar - check if ctag changed
-            if (calendar->ctag() == ctag && ctag != "") {
+            if (!reconciliationDue && calendar->ctag() == ctag && ctag != "") {
                 logger->info("Calendar '{}' unchanged (ctag: {}), skipping sync", name, ctag);
                 needsSync = false;
             }
@@ -1529,9 +1691,13 @@ void DAVWorker::runCalendars() {
             // return errors instead of graceful decline (Zimbra, Posteo), or have unreliable
             // implementations (Synology, DAViCal, Bedework, Nextcloud). See function comments.
             string calURL = (path.find("://") != string::npos) ? path : replacePath(calendarHomeURL, path);
-            bool usedSyncToken = runForCalendarWithSyncToken(id, calURL, calendar);
+            // Periodically compare the bounded ETag inventory even if both ctag
+            // and sync-token would otherwise conceal a previously missed item.
+            bool usedSyncToken = !reconciliationDue && runForCalendarWithSyncToken(id, calURL, calendar);
             if (!usedSyncToken) {
                 runForCalendar(id, name, calURL);
+                calendar->setLastEventReconciliation(static_cast<long long>(time(nullptr)));
+                store->save(calendar.get());
             }
 
             // Update ctag after successful sync
@@ -1549,6 +1715,7 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
 
     // Remote: href -> etag (from server)
     map<string, string> remote {};
+    map<string, string> originalHrefs {};
     {
         // Request events within the time range. The server expands recurring events
         // and returns any event where at least one instance falls within the range.
@@ -1591,10 +1758,20 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
 
         auto eventEtagsDoc = performXMLRequest(url, "REPORT", query);
 
+        bool validInventory = false;
+        eventEtagsDoc->evaluateXPath("/D:multistatus", [&](xmlNodePtr) { validInventory = true; });
+        if (!validInventory) {
+            throw SyncException("incomplete-calendar-list", "Calendar inventory is not a DAV multistatus response", true);
+        }
+
         eventEtagsDoc->evaluateXPath("//D:response", ([&](xmlNodePtr node) {
             auto etag = eventEtagsDoc->nodeContentAtXPath(".//D:getetag/text()", node);
             auto href = eventEtagsDoc->nodeContentAtXPath(".//D:href/text()", node);
+            if (href.empty() || etag.empty()) {
+                throw SyncException("incomplete-calendar-list", "Calendar inventory contains an unsuccessful resource response", true);
+            }
             remote[normalizeHref(href)] = string(etag.c_str());
+            originalHrefs[normalizeHref(href)] = href;
         }));
     }
 
@@ -1649,20 +1826,10 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
         logger->info("  needed: {}", neededHrefs.size());
     }
 
-    // Process deletions in their own short transactions before multiget
-    for (auto & deletionChunk : MailUtils::chunksOfVector(deletedIcsUIDs, 100)) {
-        MailStoreTransaction transaction{store, "runForCalendar:deletions"};
-        auto deletionEvents = store->findAll<Event>(Query().equal("calendarId", calendarId).equal("icsuid", deletionChunk));
-        for (auto & e : deletionEvents) {
-            store->remove(e.get());
-        }
-        transaction.commit();
-    }
-
     for (auto chunk : MailUtils::chunksOfVector(neededHrefs, 90)) {
         string payload = "";
         for (auto & href : chunk) {
-            payload += "<d:href>" + href + "</d:href>";
+            payload += "<d:href>" + CalendarSyncPolicy::hrefText(originalHrefs.at(href)) + "</d:href>";
         }
 
         // Fetch the data (rate limiting is now handled in performXMLRequest)
@@ -1671,6 +1838,7 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
         // Phase 1: Parse ICS data OUTSIDE the transaction
         vector<shared_ptr<ICalendar>> parsedCalendars;
         vector<ParsedCalEvent> parsedEvents;
+        set<string> receivedHrefs;
 
         icsDoc->evaluateXPath("//D:response", ([&](xmlNodePtr node) {
             auto etag = icsDoc->nodeContentAtXPath(".//D:getetag/text()", node);
@@ -1689,16 +1857,24 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
             parsedCalendars.push_back(cal);
 
             auto href = icsDoc->nodeContentAtXPath(".//D:href/text()", node);
+            bool complete = true;
 
             // Process ALL VEVENTs in the ICS file (master + any recurrence exceptions)
             for (auto icsEvent : cal->Events) {
                 if (icsEvent->DtStart.IsEmpty()) {
-                    logger->info("Received calendar event but it has no start time?\n\n{}\n\n", icsData);
+                    complete = false;
                     continue;
                 }
                 parsedEvents.push_back({etag, href, icsData, icsEvent});
             }
+            if (complete) receivedHrefs.insert(normalizeHref(href));
         }));
+
+        for (const auto& href : chunk) {
+            if (!receivedHrefs.count(href)) {
+                throw SyncException("incomplete-calendar-fetch", "Calendar download was incomplete; retaining the previous sync checkpoint for retry", true);
+            }
+        }
 
         // Phase 2: DB operations INSIDE a short transaction
         {
@@ -1728,6 +1904,13 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
             }
             transaction.commit();
         }
+    }
+    // Only prune after every requested resource has downloaded and parsed.
+    for (auto & deletionChunk : MailUtils::chunksOfVector(deletedIcsUIDs, 100)) {
+        MailStoreTransaction transaction{store, "runForCalendar:deletions"};
+        auto deletionEvents = store->findAll<Event>(Query().equal("calendarId", calendarId).equal("icsuid", deletionChunk));
+        for (auto & e : deletionEvents) store->remove(e.get());
+        transaction.commit();
     }
 }
 
@@ -2091,12 +2274,17 @@ bool DAVWorker::runForCalendarWithSyncToken(string calendarId, string url, share
 // WWW-Authenticate. This is more efficient (avoids an extra round-trip) and sidesteps
 // all server-specific header formatting quirks.
 const string DAVWorker::getAuthorizationHeader() {
-    if (account->refreshToken() != "") {
+    // CalDAVUsername/Password default to the account's IMAP credentials. A user
+    // may explicitly override either value for a separate calendar service.
+    // OAuth accounts (notably Gmail) generally have no stored IMAP password and
+    // use their provider access token instead.
+    string davPassword = account->CalDAVPassword();
+    if (davPassword == "" && account->refreshToken() != "") {
         auto parts = SharedXOAuth2TokenManager()->partsForAccount(account);
         return "Authorization: Bearer " + parts.accessToken;
     }
 
-    string plain = account->IMAPUsername() + ":" + account->IMAPPassword();
+    string plain = account->CalDAVUsername() + ":" + davPassword;
     string encoded = MailUtils::toBase64(plain.c_str(), strlen(plain.c_str()));
     return "Authorization: Basic " + encoded;
 }
@@ -2133,6 +2321,12 @@ shared_ptr<DavXML> DAVWorker::performXMLRequest(string _url, string method, stri
     const char * payloadChars = payload.c_str();
     curl_easy_setopt(curl_handle, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 40);
+    // DAV deployments commonly canonicalize /WebDAV and collection URLs with
+    // 301/302 redirects. Follow a small number of HTTPS-only redirects. Curl
+    // deliberately does not forward Authorization to a different host.
+    curl_easy_setopt(curl_handle, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl_handle, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(curl_handle, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
     curl_easy_setopt(curl_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
     curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl_handle, CURLOPT_POSTFIELDS, payloadChars);

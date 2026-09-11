@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "Account.hpp"
@@ -72,6 +72,18 @@ string Account::provider() {
     return _data["provider"].get<string>();
 }
 
+bool Account::usesMicrosoftGraph() {
+    json & s = _data["settings"];
+    return s.count("sync_engine") && s["sync_engine"].is_string() &&
+           s["sync_engine"].get<string>() == "microsoft_graph";
+}
+
+string Account::graphMailbox() {
+    json & s = _data["settings"];
+    return s.count("graph_mailbox") && s["graph_mailbox"].is_string()
+        ? s["graph_mailbox"].get<string>() : "";
+}
+
 string Account::emailAddress() {
     return _data["emailAddress"].get<string>();
 }
@@ -119,6 +131,45 @@ string Account::IMAPSecurity() {
 
 bool Account::IMAPAllowInsecureSSL() {
     return _data["settings"]["imap_allow_insecure_ssl"].get<bool>();
+}
+
+string Account::CalDAVHost() {
+    json & s = _data["settings"];
+
+    if (usesMicrosoftGraph()) {
+        if (!(s.count("refresh_token") && s.count("refresh_client_id"))) {
+            return "Microsoft Graph OAuth configuration";
+        }
+        return "";
+    }
+    return s.count("caldav_host") ? s["caldav_host"].get<string>() : "";
+}
+
+string Account::CardDAVHost() {
+    json & s = _data["settings"];
+    return s.count("carddav_host") && !s["carddav_host"].get<string>().empty()
+        ? s["carddav_host"].get<string>()
+        : CalDAVHost();
+}
+
+string Account::CalDAVUsername() {
+    json & s = _data["settings"];
+    // Calendar authentication deliberately inherits the working IMAP login.
+    // A separate value is only an opt-in override for servers that require it.
+    if (s.count("caldav_username") && s["caldav_username"].is_string()) {
+        string configured = s["caldav_username"].get<string>();
+        if (!configured.empty()) return configured;
+    }
+    return IMAPUsername();
+}
+
+string Account::CalDAVPassword() {
+    json & s = _data["settings"];
+    if (s.count("caldav_password") && s["caldav_password"].is_string()) {
+        string configured = s["caldav_password"].get<string>();
+        if (!configured.empty()) return configured;
+    }
+    return IMAPPassword();
 }
 
 bool Account::isICloud() {

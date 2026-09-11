@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "TaskProcessor.hpp"
@@ -27,12 +27,14 @@
 #include "ProgressCollectors.hpp"
 #include "SyncException.hpp"
 #include "NetworkRequestUtils.hpp"
+#include "XOAuth2TokenManager.hpp"
 
 #include <sstream>
 #include <algorithm>
 #include <iomanip>
 #include <thread>
 #include <chrono>
+#include <set>
 
 #if defined(_MSC_VER)
 #include <direct.h>
@@ -44,6 +46,28 @@
 #endif
 
 using namespace std;
+
+static string taskGraphUrlEncode(const string & value) {
+    CURL *curl = curl_easy_init();
+    char *encoded = curl_easy_escape(curl, value.c_str(), (int)value.size());
+    string result = encoded ? encoded : "";
+    if (encoded) curl_free(encoded);
+    curl_easy_cleanup(curl);
+    return result;
+}
+
+static Data * fetchMicrosoftGraphMIME(shared_ptr<Account> account, Message * message) {
+    if (message->graphId().empty()) {
+        throw SyncException("not-found", "Microsoft Graph message ID is unavailable.", false);
+    }
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    string url = MicrosoftGraphBaseURL(account) + "/messages/" +
+        taskGraphUrlEncode(message->graphId()) + "/$value";
+    CURL * request = CreateMicrosoftGraphRequest(url, "GET", token);
+    string raw = PerformRequest(request);
+    CleanupCurlRequest(request);
+    return Data::dataWithBytes(raw.c_str(), (unsigned int)raw.size());
+}
 using namespace mailcore;
 using namespace nlohmann;
 
@@ -460,6 +484,9 @@ void TaskProcessor::performLocal(Task * task) {
         } else if (cname == "GetManyRFC2822Task") {
             // nothing — all work happens in performRemote
 
+        } else if (cname == "CrossAccountMoveFolderTask") {
+            // Both phases perform network I/O in performRemote.
+
         } else if (cname == "EventRSVPTask") {
             // nothing
 
@@ -516,13 +543,16 @@ void TaskProcessor::performRemote(Task * task) {
             task->setStatus("cancelled");
         } else {
             if (cname == "ChangeUnreadTask") {
-                performRemoteChangeOnMessages(task, false, _applyUnreadInIMAPFolder);
+                if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
+                else performRemoteChangeOnMessages(task, false, _applyUnreadInIMAPFolder);
                 
             } else if (cname == "ChangeStarredTask") {
-                performRemoteChangeOnMessages(task, false, _applyStarredInIMAPFolder);
+                if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
+                else performRemoteChangeOnMessages(task, false, _applyStarredInIMAPFolder);
                 
             } else if (cname == "ChangeFolderTask") {
-                performRemoteChangeOnMessages(task, true, _applyFolderMoveInIMAPFolder);
+                if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
+                else performRemoteChangeOnMessages(task, true, _applyFolderMoveInIMAPFolder);
 
             } else if (cname == "ChangeLabelsTask") {
                 performRemoteChangeOnMessages(task, false, _applyLabelChangeInIMAPFolder);
@@ -559,6 +589,9 @@ void TaskProcessor::performRemote(Task * task) {
 
             } else if (cname == "GetManyRFC2822Task") {
                 performRemoteGetManyRFC2822(task);
+
+            } else if (cname == "CrossAccountMoveFolderTask") {
+                performRemoteCrossAccountMoveFolder(task);
 
             } else if (cname == "EventRSVPTask") {
                 performRemoteSendRSVP(task);
@@ -642,7 +675,7 @@ Message TaskProcessor::inflateClientDraftJSON(json & draftJSON, shared_ptr<Messa
             folder = store->find<Folder>(q);
         }
         if (folder == nullptr) {
-            throw SyncException("no-drafts-folder", "Mailspring can't find your Drafts folder. To create and send mail, visit Preferences > Folders and choose a Drafts folder.", false);
+            throw SyncException("no-drafts-folder", "SummerMail can't find your Drafts folder. To create and send mail, visit Preferences > Folders and choose a Drafts folder.", false);
         }
         base = {
             {"remoteUID", 0},
@@ -832,6 +865,55 @@ void TaskProcessor::performRemoteChangeOnMessages(Task * task, bool updatesFolde
     }
 }
 
+void TaskProcessor::performRemoteMicrosoftGraphChange(Task * task) {
+    json & data = task->data();
+    string cname = task->constructorName();
+    auto messages = inflateMessages(data).messages;
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    shared_ptr<Folder> destination = nullptr;
+    if (cname == "ChangeFolderTask") {
+        destination = store->find<Folder>(Query().equal("id", data["folder"]["id"].get<string>()));
+        if (!destination || !destination->localStatus().count("graphId")) {
+            throw SyncException("invalid-graph-folder", "The Microsoft Graph destination folder is unavailable.", false);
+        }
+    }
+
+    map<string, string> movedGraphIds;
+    for (auto & message : messages) {
+        if (message->graphId().empty()) continue;
+        string url = MicrosoftGraphBaseURL(account) + "/messages/" + taskGraphUrlEncode(message->graphId());
+        json payload;
+        string method = "PATCH";
+        if (cname == "ChangeUnreadTask") {
+            payload = {{"isRead", !data["unread"].get<bool>()}};
+        } else if (cname == "ChangeStarredTask") {
+            payload = {{"flag", {{"flagStatus", data["starred"].get<bool>() ? "flagged" : "notFlagged"}}}};
+        } else if (cname == "ChangeFolderTask") {
+            method = "POST";
+            url += "/move";
+            payload = {{"destinationId", destination->localStatus()["graphId"]}};
+        }
+        string serialized = payload.dump();
+        json response = PerformJSONRequest(CreateMicrosoftGraphRequest(url, method, token, serialized.c_str()));
+        if (cname == "ChangeFolderTask" && response.count("id")) {
+            movedGraphIds[message->id()] = response["id"].get<string>();
+        }
+    }
+
+    MailStoreTransaction transaction{store, "performRemoteMicrosoftGraphChange"};
+    auto safeMessages = inflateMessages(data).messages;
+    for (auto & safe : safeMessages) {
+        if (destination) safe->setRemoteFolder(destination.get());
+        if (movedGraphIds.count(safe->id())) safe->setGraphId(movedGraphIds[safe->id()]);
+        int remaining = max(0, safe->syncUnsavedChanges() - 1);
+        safe->setSyncUnsavedChanges(remaining);
+        if (remaining == 0) safe->setSyncedAt(time(0));
+        store->save(safe.get());
+    }
+    store->unsafeEraseTransactionDeltas();
+    transaction.commit();
+}
+
 void TaskProcessor::performLocalSaveDraft(Task * task) {
     json & draftJSON = task->data()["draft"];
     
@@ -877,7 +959,7 @@ void TaskProcessor::performLocalDestroyDraft(Task * task) {
     // Find the trash folder
     auto trash = store->find<Folder>(Query().equal("accountId", account->id()).equal("role", "trash"));
     if (trash == nullptr) {
-        throw SyncException("no-trash-folder", "Mailspring doesn't know which folder to use for trash. Visit Preferences > Folders to assign a trash folder.", false);
+        throw SyncException("no-trash-folder", "SummerMail doesn't know which folder to use for trash. Visit Preferences > Folders to assign a trash folder.", false);
     }
 
     auto stubIds = json::array();
@@ -916,6 +998,15 @@ void TaskProcessor::performRemoteDestroyDraft(Task * task) {
     for (auto & stub : stubs) {
         if (stub->remoteUID() == 0) {
             continue; // not synced to server at all
+        }
+        if (account->usesMicrosoftGraph()) {
+            if (!stub->graphId().empty()) {
+                auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+                string url = MicrosoftGraphBaseURL(account) + "/messages/" + taskGraphUrlEncode(stub->graphId());
+                PerformJSONRequest(CreateMicrosoftGraphRequest(url, "DELETE", token));
+            }
+            store->remove(stub.get());
+            continue;
         }
         auto uids = IndexSet::indexSetWithIndex(stub->remoteUID());
         String * path = AS_MCSTR(stub->remoteFolder()["path"].get<string>());
@@ -1305,6 +1396,44 @@ void TaskProcessor::performRemoteSyncbackCategory(Task * task) {
     string path = data["path"].get<string>();
     string existingPath = data.count("existingPath") ? data["existingPath"].get<string>() : "";
 
+    if (account->usesMicrosoftGraph()) {
+        auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+        string displayName = path.substr(path.find_last_of('/') == string::npos ? 0 : path.find_last_of('/') + 1);
+        json payload = {{"displayName", displayName}};
+        string serialized = payload.dump();
+        json remote;
+        shared_ptr<Folder> localModel = nullptr;
+        if (!existingPath.empty()) {
+            localModel = store->find<Folder>(Query().equal("accountId", accountId).equal("path", existingPath));
+            if (!localModel || !localModel->localStatus().count("graphId")) {
+                throw SyncException("invalid-graph-folder", "The Microsoft Graph folder to rename was not found.", false);
+            }
+            string url = MicrosoftGraphBaseURL(account) + "/mailFolders/" +
+                taskGraphUrlEncode(localModel->localStatus()["graphId"].get<string>());
+            remote = PerformJSONRequest(CreateMicrosoftGraphRequest(url, "PATCH", token, serialized.c_str()));
+        } else {
+            string parentPath = path.find_last_of('/') == string::npos ? "" : path.substr(0, path.find_last_of('/'));
+            string url = MicrosoftGraphBaseURL(account) + "/mailFolders";
+            if (!parentPath.empty()) {
+                auto parent = store->find<Folder>(Query().equal("accountId", accountId).equal("path", parentPath));
+                if (!parent || !parent->localStatus().count("graphId")) {
+                    throw SyncException("invalid-graph-folder", "The Microsoft Graph parent folder was not found.", false);
+                }
+                url += "/" + taskGraphUrlEncode(parent->localStatus()["graphId"].get<string>()) + "/childFolders";
+            }
+            remote = PerformJSONRequest(CreateMicrosoftGraphRequest(url, "POST", token, serialized.c_str()));
+            string graphId = remote.value("id", "");
+            if (graphId.empty()) throw SyncException("invalid-graph-folder", "Microsoft Graph did not return the created folder.", false);
+            localModel = make_shared<Folder>(MailUtils::idForFolder(accountId, "graph:" + graphId), accountId, 0);
+            localModel->localStatus()["graphId"] = graphId;
+        }
+        localModel->setPath(path);
+        localModel->setRole("");
+        data["created"] = localModel->toJSON();
+        store->save(localModel.get());
+        return;
+    }
+
     // if the requested path includes "/" delimiters, replace them with the real delimiter
     char delimiter = session->defaultNamespace()->mainDelimiter();
     std::replace(path.begin(), path.end(), '/', delimiter);
@@ -1409,6 +1538,15 @@ void TaskProcessor::performRemoteDestroyCategory(Task * task) {
     json & data = task->data();
     string accountId = task->accountId();
     string path = data["path"].get<string>();
+    if (account->usesMicrosoftGraph()) {
+        auto folder = store->find<Folder>(Query().equal("accountId", accountId).equal("path", path));
+        if (!folder || !folder->localStatus().count("graphId")) return;
+        auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+        string url = MicrosoftGraphBaseURL(account) + "/mailFolders/" +
+            taskGraphUrlEncode(folder->localStatus()["graphId"].get<string>());
+        PerformJSONRequest(CreateMicrosoftGraphRequest(url, "DELETE", token));
+        return;
+    }
     ErrorCode err = ErrorCode::ErrorNone;
     
     session->deleteFolder(AS_MCSTR(path), &err);
@@ -1453,7 +1591,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
     if (sent == nullptr) {
         sent = store->find<Label>(Query().equal("accountId", account->id()).equal("role", "sent"));
         if (sent == nullptr) {
-            throw SyncException("no-sent-folder", "Mailspring doesn't know which folder to use for sent mail. Visit Preferences > Folders to assign a sent folder.", false);
+            throw SyncException("no-sent-folder", "SummerMail doesn't know which folder to use for sent mail. Visit Preferences > Folders to assign a sent folder.", false);
         }
     }
     String * sentPath = AS_MCSTR(sent->path());
@@ -1480,7 +1618,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
 
     builder.header()->setSubject(AS_MCSTR(draft.subject()));
     builder.header()->setMessageID(AS_MCSTR(draft.headerMessageId()));
-    builder.header()->setUserAgent(MCSTR("Mailspring"));
+    builder.header()->setUserAgent(MCSTR("SummerMail"));
     builder.header()->setDate(time(0));
     
     // todo: lookup thread reference entire chain?
@@ -1558,6 +1696,21 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
 
     // Save the message data / body we'll write to the sent folder
     Data * messageDataForSent = builder.data();
+
+    if (account->usesMicrosoftGraph()) {
+        if (multisend) {
+            throw SyncException("graph-multisend-unsupported", "Per-recipient multisend is not yet supported for Microsoft Graph accounts.", false);
+        }
+        auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+        string mime((const char *)messageDataForSent->bytes(), messageDataForSent->length());
+        string encoded = MailUtils::toBase64(mime.c_str(), mime.size());
+        CURL * request = CreateMicrosoftGraphMimeRequest(
+            MicrosoftGraphBaseURL(account) + "/sendMail", token, encoded);
+        PerformRequest(request);
+        CleanupCurlRequest(request);
+        if (existing) store->remove(existing.get());
+        return;
+    }
 
     /*
     OK! If we've reached this point we're going to deliver the message. To do multisend,
@@ -1859,6 +2012,19 @@ void TaskProcessor::performRemoteExpungeAllInFolder(Task * task) {
     const auto path = task->data()["folder"]["path"].get<string>();
     const auto id = task->data()["folder"]["id"].get<string>();
 
+    if (account->usesMicrosoftGraph()) {
+        auto messages = store->findAll<Message>(Query().equal("accountId", task->accountId()).equal("remoteFolderId", id));
+        auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+        for (auto & message : messages) {
+            if (!message->graphId().empty()) {
+                string url = MicrosoftGraphBaseURL(account) + "/messages/" + taskGraphUrlEncode(message->graphId());
+                PerformJSONRequest(CreateMicrosoftGraphRequest(url, "DELETE", token));
+            }
+            store->remove(message.get());
+        }
+        return;
+    }
+
     IndexSet set;
     set.addRange(RangeMake(1, UINT64_MAX));
     session->storeFlagsByUID(AS_MCSTR(path), &set, IMAPStoreFlagsRequestKindAdd, MessageFlagDeleted, &err);
@@ -1900,7 +2066,9 @@ void TaskProcessor::performRemoteGetMessageRFC2822(Task * task) {
         throw SyncException("not-found", "Message not found for RFC2822 fetch", false);
     }
 
-    Data * data = session->fetchMessageByUID(AS_MCSTR(msg->remoteFolder()["path"].get<string>()), msg->remoteUID(), &cb, &err);
+    Data * data = account->usesMicrosoftGraph()
+        ? fetchMicrosoftGraphMIME(account, msg.get())
+        : session->fetchMessageByUID(AS_MCSTR(msg->remoteFolder()["path"].get<string>()), msg->remoteUID(), &cb, &err);
     if (err != ErrorNone) {
         logger->error("Unable to fetch rfc2822 for message (UID {}). Error {}", msg->remoteUID(), ErrorCodeToTypeMap[err]);
         throw SyncException(err, "performRemoteGetMessageRFC2822");
@@ -2055,8 +2223,9 @@ void TaskProcessor::performRemoteGetManyRFC2822(Task * task) {
             ErrorCode err = ErrorNone;
 
             try {
-                Data * data = session->fetchMessageByUID(
-                    AS_MCSTR(folderPath), msg->remoteUID(), &cb, &err);
+                Data * data = account->usesMicrosoftGraph()
+                    ? fetchMicrosoftGraphMIME(account, msg.get())
+                    : session->fetchMessageByUID(AS_MCSTR(folderPath), msg->remoteUID(), &cb, &err);
 
                 if (err != ErrorNone) {
                     throw SyncException(err, "GetManyRFC2822 fetch");
@@ -2145,6 +2314,204 @@ void TaskProcessor::performRemoteGetManyRFC2822(Task * task) {
         exported, total, failed);
 }
 
+void TaskProcessor::performRemoteCrossAccountMoveFolder(Task * task) {
+    if (!task->data().count("phase") || !task->data()["phase"].is_string()) {
+        throw SyncException("missing-json", "Cross-account transfer is missing a phase", false);
+    }
+
+    const string phase = task->data()["phase"].get<string>();
+    if (phase == "prepare") {
+        prepareCrossAccountMoveFolder(task);
+    } else if (phase == "import") {
+        importCrossAccountMoveFolder(task);
+    } else {
+        throw SyncException("invalid-json", "Unknown cross-account transfer phase", false);
+    }
+}
+
+void TaskProcessor::prepareCrossAccountMoveFolder(Task * task) {
+    json & data = task->data();
+    if (!data.count("threadIds") || !data["threadIds"].is_array() ||
+        !data.count("stagingDirectory") || !data["stagingDirectory"].is_string()) {
+        throw SyncException("missing-json", "Cross-account prepare requires threadIds and stagingDirectory", false);
+    }
+
+    const string stagingDirectory = data["stagingDirectory"].get<string>();
+    auto messages = inflateMessages(data).messages;
+    if (messages.empty()) {
+        throw SyncException("not-found", "No source messages were found for the selected conversations", false);
+    }
+
+    json result = data.count("result") && data["result"].is_object()
+        ? data["result"]
+        : json::object();
+    if (!result.count("files") || !result["files"].is_array()) {
+        result["files"] = json::array();
+    }
+
+    set<string> preparedMessageIds;
+    for (auto & entry : result["files"]) {
+        if (entry.count("messageId") && entry["messageId"].is_string()) {
+            preparedMessageIds.insert(entry["messageId"].get<string>());
+        }
+    }
+
+    int index = (int)result["files"].size();
+    for (auto & msg : messages) {
+        if (msg->isDraft() || msg->isDeletionPlaceholder() || msg->remoteUID() == 0) {
+            continue;
+        }
+        if (preparedMessageIds.count(msg->id())) {
+            continue;
+        }
+
+        AutoreleasePool pool;
+        IMAPProgress progress;
+        ErrorCode err = ErrorNone;
+        Data * raw = session->fetchMessageByUID(
+            AS_MCSTR(msg->remoteFolder()["path"].get<string>()), msg->remoteUID(), &progress, &err);
+        if (err != ErrorNone) {
+            throw SyncException(err, "Cross-account source RFC822 fetch");
+        }
+        if (raw == nullptr) {
+            throw SyncException(ErrorFetch, "Cross-account source RFC822 fetch returned no data");
+        }
+
+        const string filepath = stagingDirectory + FS_PATH_SEP +
+            to_string(index++) + "-" + msg->id() + ".eml";
+#ifdef _MSC_VER
+        wstring_convert<codecvt_utf8<wchar_t>, wchar_t> convert;
+        ErrorCode writeErr = raw->writeToFile(AS_WIDE_MCSTR(convert.from_bytes(filepath)));
+#else
+        ErrorCode writeErr = raw->writeToFile(AS_MCSTR(filepath));
+#endif
+        if (writeErr != ErrorNone) {
+            throw SyncException(writeErr, "Cross-account staging file write");
+        }
+        setFileModificationTime(filepath, msg->date());
+
+        json entry;
+        entry["filepath"] = filepath;
+        entry["messageId"] = msg->id();
+        entry["headerMessageId"] = msg->headerMessageId();
+        entry["date"] = msg->date();
+        entry["unread"] = msg->isUnread();
+        entry["starred"] = msg->isStarred();
+        result["files"].push_back(entry);
+        result["completed"] = result["files"].size();
+        data["result"] = result;
+        store->save(task);
+    }
+
+    result["total"] = result["files"].size();
+    result["completed"] = result["files"].size();
+    data["result"] = result;
+    if (result["files"].empty()) {
+        throw SyncException("not-found", "The selected conversations contain no transferable messages", false);
+    }
+    store->save(task);
+    logger->info("Cross-account prepare staged {} messages", result["files"].size());
+}
+
+void TaskProcessor::importCrossAccountMoveFolder(Task * task) {
+    json & data = task->data();
+    if (!data.count("files") || !data["files"].is_array() ||
+        !data.count("targetFolder") || !data["targetFolder"].is_object()) {
+        throw SyncException("missing-json", "Cross-account import requires files and targetFolder", false);
+    }
+
+    json & targetFolder = data["targetFolder"];
+    if (!targetFolder.count("aid") || targetFolder["aid"].get<string>() != task->accountId() ||
+        !targetFolder.count("path") || !targetFolder["path"].is_string()) {
+        throw SyncException("bad-accountid", "Cross-account destination folder does not belong to this account", false);
+    }
+    const string targetPathString = targetFolder["path"].get<string>();
+    String * targetPath = AS_MCSTR(targetPathString);
+
+    json result = data.count("result") && data["result"].is_object()
+        ? data["result"]
+        : json::object();
+    if (!result.count("appendedMessageIds") || !result["appendedMessageIds"].is_array()) {
+        result["appendedMessageIds"] = json::array();
+    }
+    if (!result.count("skippedMessageIds") || !result["skippedMessageIds"].is_array()) {
+        result["skippedMessageIds"] = json::array();
+    }
+
+    set<string> completed;
+    for (auto & id : result["appendedMessageIds"]) completed.insert(id.get<string>());
+    for (auto & id : result["skippedMessageIds"]) completed.insert(id.get<string>());
+
+    for (auto & file : data["files"]) {
+        const string messageId = file["messageId"].get<string>();
+        if (completed.count(messageId)) continue;
+
+        AutoreleasePool pool;
+        const string filepath = file["filepath"].get<string>();
+#ifdef _MSC_VER
+        wstring_convert<codecvt_utf8<wchar_t>, wchar_t> convert;
+        Data * raw = Data::dataWithContentsOfFile(AS_WIDE_MCSTR(convert.from_bytes(filepath)));
+#else
+        Data * raw = Data::dataWithContentsOfFile(AS_MCSTR(filepath));
+#endif
+        if (raw == nullptr) {
+            throw SyncException("not-found", "A staged cross-account message file is missing", false);
+        }
+
+        bool alreadyPresent = false;
+        const string headerMessageId = file.count("headerMessageId")
+            ? file["headerMessageId"].get<string>()
+            : "";
+        if (!headerMessageId.empty() && headerMessageId != "no-header-message-id") {
+            ErrorCode searchErr = ErrorNone;
+            IMAPSearchExpression * expr = IMAPSearchExpression::searchHeader(
+                MCSTR("Message-ID"), AS_MCSTR(headerMessageId));
+            IndexSet * existing = session->search(targetPath, expr, &searchErr);
+            if (searchErr == ErrorNone && existing != nullptr && existing->count() > 0) {
+                alreadyPresent = true;
+            } else if (searchErr != ErrorNone) {
+                logger->warn("Cross-account Message-ID deduplication search failed: {}",
+                    ErrorCodeToTypeMap[searchErr]);
+            }
+        }
+
+        if (alreadyPresent) {
+            result["skippedMessageIds"].push_back(messageId);
+        } else {
+            MessageFlag flags = MessageFlagNone;
+            if (file.count("unread") && !file["unread"].get<bool>()) {
+                flags = (MessageFlag)(flags | MessageFlagSeen);
+            }
+            if (file.count("starred") && file["starred"].get<bool>()) {
+                flags = (MessageFlag)(flags | MessageFlagFlagged);
+            }
+            const time_t messageDate = file.count("date")
+                ? (time_t)file["date"].get<long long>()
+                : (time_t)-1;
+            IMAPProgress progress;
+            uint32_t createdUID = 0;
+            ErrorCode appendErr = ErrorNone;
+            session->appendMessageWithCustomFlagsAndDate(
+                targetPath, raw, flags, nullptr, messageDate, &progress, &createdUID, &appendErr);
+            if (appendErr != ErrorNone) {
+                throw SyncException(appendErr, "Cross-account IMAP APPEND");
+            }
+            result["appendedMessageIds"].push_back(messageId);
+        }
+
+        completed.insert(messageId);
+        result["total"] = data["files"].size();
+        result["completed"] = completed.size();
+        data["result"] = result;
+        // Persist after every APPEND so a worker restart can resume without
+        // duplicating messages already committed remotely.
+        store->save(task);
+    }
+
+    logger->info("Cross-account import completed {} of {} messages",
+        completed.size(), data["files"].size());
+}
+
 void TaskProcessor::performRemoteSendRSVP(Task * task) {
     AutoreleasePool pool;
     ErrorCode err = ErrorNone;
@@ -2225,6 +2592,15 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
         attendeeEmail = attendeeInfo;
     }
 
+    // The parser may preserve the iCalendar URI scheme. Compare actual mailbox
+    // addresses rather than treating "MAILTO:user@example.com" as a different
+    // sender from "user@example.com".
+    string lowerAttendeePrefix = attendeeEmail;
+    transform(lowerAttendeePrefix.begin(), lowerAttendeePrefix.end(), lowerAttendeePrefix.begin(), ::tolower);
+    if (lowerAttendeePrefix.find("mailto:") == 0) {
+        attendeeEmail = attendeeEmail.substr(7);
+    }
+
     // Validation 7: Verify From address matches ATTENDEE email (RFC 6047 requirement)
     // Mismatches may cause the RSVP to be rejected by the organizer's calendar
     string fromEmail = account->emailAddress();
@@ -2259,7 +2635,7 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
     }
 
     // Generate a unique boundary for multipart message
-    string boundary = "----=_Mailspring_RSVP_" + to_string(time(0)) + "_" + to_string(rand());
+    string boundary = "----=_SummerMail_RSVP_" + to_string(time(0)) + "_" + to_string(rand());
 
     // Base64 encode the ICS data (RFC 6047 recommends base64 for maximum compatibility)
     Data * icsData = AS_MCSTR(ics)->dataUsingEncoding("utf-8");
@@ -2268,7 +2644,7 @@ void TaskProcessor::performRemoteSendRSVP(Task * task) {
     // Build MIME headers
     MessageBuilder builder;
     builder.header()->setSubject(AS_MCSTR(subject));
-    builder.header()->setUserAgent(MCSTR("Mailspring"));
+    builder.header()->setUserAgent(MCSTR("SummerMail"));
     builder.header()->setDate(time(0));
 
     Array * toArray = Array::array();

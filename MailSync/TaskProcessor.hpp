@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #ifndef TaskProcessor_hpp
@@ -57,6 +57,7 @@ private:
 
     void performLocalChangeOnMessages(Task * task,  void (*modifyLocalMessage)(Message *, json &));
     void performRemoteChangeOnMessages(Task * task, bool updatesFolder, void (*applyInFolder)(IMAPSession * session, String * path, IndexSet * uids, vector<shared_ptr<Message>> messages, json & data));
+    void performRemoteMicrosoftGraphChange(Task * task);
     void performLocalSaveDraft(Task * task);
     void performLocalDestroyDraft(Task * task);
     void performRemoteDestroyDraft(Task * task);
@@ -98,6 +99,9 @@ private:
     void performRemoteExpungeAllInFolder(Task * task);
     void performRemoteGetMessageRFC2822(Task * task);
     void performRemoteGetManyRFC2822(Task * task);
+    void performRemoteCrossAccountMoveFolder(Task * task);
+    void prepareCrossAccountMoveFolder(Task * task);
+    void importCrossAccountMoveFolder(Task * task);
     void performRemoteSendRSVP(Task * task);
 
 public:

@@ -62,7 +62,7 @@
       <EnvironmentVariables>
          <EnvironmentVariable
             key = "CONFIG_DIR_PATH"
-            value = "~/Library/Application Support/Mailspring-dev"
+            value = "~/Library/Application Support/SummerMail-dev"
             isEnabled = "YES">
          </EnvironmentVariable>
          <EnvironmentVariable

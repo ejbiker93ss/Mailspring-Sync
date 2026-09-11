@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Mailspring-Sync is the native C++17 sync engine for the Mailspring email client. It handles email, contact, and calendar synchronization via IMAP/SMTP using MailCore2, storing data in SQLite with a JSON-based schema.
+SummerMail-Sync is the native C++17 sync engine for the SummerMail email client. It handles email, contact, and calendar synchronization via IMAP/SMTP using MailCore2, storing data in SQLite with a JSON-based schema.
 
 ## Build Commands
 
@@ -63,7 +63,7 @@ For debugging in Xcode/Visual Studio, configure the debugger to pass `--identity
 
 ### Reactive Data Flow (Core Path)
 
-All database changes flow through an entity layer and are emitted as a JSON event stream to stdout, enabling the Mailspring UI to reactively update.
+All database changes flow through an entity layer and are emitted as a JSON event stream to stdout, enabling the SummerMail UI to reactively update.
 
 **Data Flow:**
 1. **Model modification** → Caller modifies a `MailModel` subclass (Message, Thread, Folder, etc.)
@@ -96,7 +96,7 @@ transaction.commit(); // All deltas emitted together
 - `DeltaStream` (`MailSync/DeltaStream.hpp`) - Singleton (`SharedDeltaStream()`) managing stdout output with buffering
 
 ### Process Model
-Each mailsync process handles a single email account. Mailspring runs one process per connected account. The process communicates via:
+Each mailsync process handles a single email account. SummerMail runs one process per connected account. The process communicates via:
 - **stdout**: Emits newline-separated JSON for all model changes (see Reactive Data Flow above)
 - **stdin**: Accepts JSON task objects and commands (queue-task, cancel-task, wake-workers, need-bodies)
 
@@ -105,7 +105,7 @@ Each mailsync process handles a single email account. Mailspring runs one proces
 - **Background thread** (`SyncWorker`): Iterates folders, performs incremental sync using CONDSTORE/XYZRESYNC
 - **Foreground thread** (`SyncWorker`): IDLEs on primary folder, handles body fetches and task execution
 - **CalContacts thread** (`DAVWorker`, `GoogleContactsWorker`): Calendar/contact sync via CardDAV/CalDAV
-- **Metadata threads** (`MetadataWorker`, `MetadataExpirationWorker`): Syncs plugin metadata to/from id.getmailspring.com
+- **Metadata threads** (`MetadataWorker`, `MetadataExpirationWorker`): Syncs plugin metadata through the configured identity service
 
 ### Key Components
 - `MailStore`: SQLite database wrapper with template-based queries. Uses "fat" rows with a `data` JSON column plus indexed columns for queryable fields. See Reactive Data Flow above.

@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "Calendar.hpp"
@@ -58,6 +58,15 @@ void Calendar::setCtag(string ctag) {
 
 string Calendar::syncToken() {
     return _data.count("syncToken") ? _data["syncToken"].get<string>() : "";
+}
+
+long long Calendar::lastEventReconciliation() {
+    return _data.count("lastEventReconciliation") && _data["lastEventReconciliation"].is_number()
+        ? _data["lastEventReconciliation"].get<long long>() : 0;
+}
+
+void Calendar::setLastEventReconciliation(long long timestamp) {
+    _data["lastEventReconciliation"] = timestamp;
 }
 
 void Calendar::setSyncToken(string token) {

@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #ifndef Account_hpp
@@ -41,6 +41,8 @@ public:
     string refreshClientId();
     string provider();
     string emailAddress();
+    bool usesMicrosoftGraph();
+    string graphMailbox();
 
     unsigned int IMAPPort();
     string IMAPHost();
@@ -48,6 +50,11 @@ public:
     string IMAPPassword();
     string IMAPSecurity();
     bool IMAPAllowInsecureSSL();
+
+    string CalDAVHost();
+    string CardDAVHost();
+    string CalDAVUsername();
+    string CalDAVPassword();
 
     bool isICloud();
 

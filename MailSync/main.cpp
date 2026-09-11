@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include <atomic>
@@ -34,6 +34,7 @@
 #include "MailStore.hpp"
 #include "DeltaStream.hpp"
 #include "SyncWorker.hpp"
+#include "FolderSyncPolicy.hpp"
 #include "MetadataWorker.hpp"
 #include "MetadataExpirationWorker.hpp"
 #include "DAVWorker.hpp"
@@ -42,12 +43,13 @@
 #include "Task.hpp"
 #include "TaskProcessor.hpp"
 #include "NetworkRequestUtils.hpp"
+#include "XOAuth2TokenManager.hpp"
 #include "ThreadUtils.h"
 #include "constants.h"
 #include "SPDLogExtensions.hpp"
 
 #if defined(__linux__)
-#include "MailspringDynamicTidy.h"
+#include "SummerMailDynamicTidy.h"
 #endif
 
 using namespace nlohmann;
@@ -126,7 +128,7 @@ struct CArg: public option::Arg
 
 // Important do not change these without updating result code 2 check below
 #define USAGE_STRING "USAGE: CONFIG_DIR_PATH=/path IDENTITY_SERVER=https://id.getmailspring.com mailsync [options]\n\nOptions:"
-#define USAGE_IDENTITY "  --identity, -i  \tRequired: Mailspring Identity JSON with credentials."
+#define USAGE_IDENTITY "  --identity, -i  \tRequired: SummerMail Identity JSON with credentials."
 
 enum  optionIndex { UNKNOWN, HELP, IDENTITY, ACCOUNT, MODE, ORPHAN, VERBOSE };
 const option::Descriptor usage[] =
@@ -135,7 +137,7 @@ const option::Descriptor usage[] =
     {HELP,    0,"" , "help",    CArg::None,      "  --help  \tPrint usage and exit." },
     {IDENTITY,0,"a", "identity",CArg::Optional,  USAGE_IDENTITY },
     {ACCOUNT, 0,"a", "account", CArg::Optional,  "  --account, -a  \tRequired: Account JSON with credentials." },
-    {MODE,    0,"m", "mode",    CArg::Required,  "  --mode, -m  \tRequired: sync, test, reset, calendar, migrate, or install-check." },
+    {MODE,    0,"m", "mode",    CArg::Required,  "  --mode, -m  \tRequired: sync, contacts, test, reset, calendar, migrate, or install-check." },
     {ORPHAN,  0,"o", "orphan",  CArg::None,      "  --orphan, -o  \tOptional: allow the process to run without a parent bound to stdin." },
     {VERBOSE, 0,"v", "verbose", CArg::None,      "  --verbose, -v  \tOptional: log all IMAP and SMTP traffic for debugging purposes." },
     {0,0,0,0,0,0}
@@ -221,7 +223,8 @@ void runBackgroundSyncWorker() {
             exceptions::logCurrentExceptionWithStackTrace();
             abort();
         }
-        MailUtils::sleepWorkerUntilWakeOrSec(120);
+        MailUtils::sleepWorkerUntilWakeOrSec(FolderSyncPolicy::backgroundPollIntervalSeconds(
+            bgWorker->account->usesMicrosoftGraph(), bgWorker->supportsIdle()));
     }
 }
 
@@ -284,6 +287,36 @@ int runTestAuth(shared_ptr<Account> account) {
     // Enable very detailed mailcore logging and redirect the messages to our accumulator log
     MCLogEnabled = 1;
     MCLogFn = MCLogToAccumulatorLog;
+
+    if (account->usesMicrosoftGraph()) {
+        json resp = {
+            {"error", nullptr},
+            {"error_service", "microsoft graph"},
+            {"log", "----------MICROSOFT GRAPH----------\n"},
+            {"account", nullptr}
+        };
+        try {
+            auto parts = SharedXOAuth2TokenManager()->partsForAccount(account);
+            auto request = CreateJSONRequest(
+                MicrosoftGraphBaseURL(account) + "/mailFolders/inbox?$select=id,displayName",
+                "GET",
+                "Bearer " + parts.accessToken
+            );
+            auto inbox = PerformJSONRequest(request);
+            if (!inbox.count("id")) {
+                throw SyncException("invalid-graph-mailbox", "Microsoft Graph did not return an Inbox folder.", false);
+            }
+            resp["account"] = account->toJSON();
+            resp["log"] = "Microsoft Graph mailbox validation succeeded. No IMAP or SMTP connection was attempted.\n";
+            cout << resp.dump();
+            return 0;
+        } catch (std::exception & ex) {
+            resp["error"] = "ErrorAuthentication";
+            resp["log"] = string("Microsoft Graph mailbox validation failed: ") + ex.what();
+            cout << resp.dump();
+            return 1;
+        }
+    }
 
     // NOTE: This method returns the account upon success but the client is not
     // reading the result. This function cannot mutate the account object.
@@ -494,7 +527,7 @@ int runInstallCheck() {
 
         // Use intentionally invalid credentials to test SASL mechanism loading
         // The email format is valid but the credentials are obviously fake
-        smtp.setUsername(MCSTR("mailspring-install-check@gmail.com"));
+        smtp.setUsername(MCSTR("summermail-install-check@gmail.com"));
         smtp.setPassword(MCSTR("invalid-password-for-sasl-test"));
 
         ErrorCode err = ErrorNone;
@@ -505,7 +538,7 @@ int runInstallCheck() {
         } else {
             // Connection succeeded, now try to authenticate
             // This will fail with wrong credentials, but we're testing that SASL works
-            Address * testAddr = Address::addressWithMailbox(MCSTR("mailspring-install-check@gmail.com"));
+            Address * testAddr = Address::addressWithMailbox(MCSTR("summermail-install-check@gmail.com"));
             smtp.checkAccount(testAddr, &err);
 
             if (err == ErrorNone) {
@@ -547,8 +580,8 @@ int runInstallCheck() {
     // Step 4: Check libtidy by actually processing HTML (Linux only)
     string tidyError = "";
 #if defined(__linux__)
-    if (!mailspring_tidy_available()) {
-        const char* err = mailspring_tidy_error();
+    if (!summermail_tidy_available()) {
+        const char* err = summermail_tidy_error();
         tidyError = err ? err : "libtidy not available";
     } else {
         // Actually test tidy by processing sample HTML, same as MCHTMLCleaner::cleanHTML
@@ -556,31 +589,31 @@ int runInstallCheck() {
         MSTidyBuffer errbuf = {0};
         MSTidyBuffer docbuf = {0};
 
-        MSTidyDoc tdoc = mailspring_tidyCreate();
+        MSTidyDoc tdoc = summermail_tidyCreate();
         if (tdoc == NULL) {
             tidyError = "tidyCreate returned NULL";
         } else {
-            mailspring_tidyBufInit(&output);
-            mailspring_tidyBufInit(&errbuf);
-            mailspring_tidyBufInit(&docbuf);
+            summermail_tidyBufInit(&output);
+            summermail_tidyBufInit(&errbuf);
+            summermail_tidyBufInit(&docbuf);
 
             // Test with simple HTML
             const char* testHTML = "<html><body><p>Test</p></body></html>";
-            mailspring_tidyBufAppend(&docbuf, (void*)testHTML, strlen(testHTML));
+            summermail_tidyBufAppend(&docbuf, (void*)testHTML, strlen(testHTML));
 
             // Use dynamically resolved option IDs for libtidy version compatibility
-            mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_XhtmlOut(), MSTidyYes);
-            mailspring_tidyOptSetInt(tdoc, mailspring_tidyOptId_DoctypeMode(), MSTidyDoctypeUser);
-            mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_Mark(), MSTidyNo);
-            mailspring_tidySetCharEncoding(tdoc, "utf8");
-            mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_ForceOutput(), MSTidyYes);
-            mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_ShowWarnings(), MSTidyNo);
-            mailspring_tidyOptSetInt(tdoc, mailspring_tidyOptId_ShowErrors(), 0);
-            mailspring_tidySetErrorBuffer(tdoc, &errbuf);
+            summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_XhtmlOut(), MSTidyYes);
+            summermail_tidyOptSetInt(tdoc, summermail_tidyOptId_DoctypeMode(), MSTidyDoctypeUser);
+            summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_Mark(), MSTidyNo);
+            summermail_tidySetCharEncoding(tdoc, "utf8");
+            summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_ForceOutput(), MSTidyYes);
+            summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_ShowWarnings(), MSTidyNo);
+            summermail_tidyOptSetInt(tdoc, summermail_tidyOptId_ShowErrors(), 0);
+            summermail_tidySetErrorBuffer(tdoc, &errbuf);
 
-            int parseResult = mailspring_tidyParseBuffer(tdoc, &docbuf);
-            int cleanResult = mailspring_tidyCleanAndRepair(tdoc);
-            int saveResult = mailspring_tidySaveBuffer(tdoc, &output);
+            int parseResult = summermail_tidyParseBuffer(tdoc, &docbuf);
+            int cleanResult = summermail_tidyCleanAndRepair(tdoc);
+            int saveResult = summermail_tidySaveBuffer(tdoc, &output);
 
             if (parseResult < 0 || cleanResult < 0 || saveResult < 0) {
                 tidyError = "tidy processing failed (parse=" + to_string(parseResult) +
@@ -590,10 +623,10 @@ int runInstallCheck() {
                 tidyError = "tidy produced no output";
             }
 
-            mailspring_tidyBufFree(&docbuf);
-            mailspring_tidyBufFree(&output);
-            mailspring_tidyBufFree(&errbuf);
-            mailspring_tidyRelease(tdoc);
+            summermail_tidyBufFree(&docbuf);
+            summermail_tidyBufFree(&output);
+            summermail_tidyBufFree(&errbuf);
+            summermail_tidyRelease(tdoc);
         }
     }
 #endif
@@ -719,9 +752,58 @@ void runListenOnMainThread(shared_ptr<Account> account) {
                 if (runningCalendarSync.compare_exchange_strong(expected, true)) {
                     std::thread([account]() {
                         SetThreadName("calendar");
-                        auto worker = DAVWorker(account);
-                        worker.run();
+                        try {
+                            auto worker = DAVWorker(account);
+                            worker.run();
+                        } catch (SyncException & ex) {
+                            // Calendar capability and credentials are independent
+                            // of IMAP. A manual calendar failure must never terminate
+                            // mailsync or put an otherwise healthy mail account into
+                            // sync_error.
+                            spdlog::get("logger")->warn(
+                                "Manual calendar sync failed ({}); mail sync will continue",
+                                ex.key
+                            );
+                        } catch (std::exception & ex) {
+                            spdlog::get("logger")->warn(
+                                "Manual calendar sync failed ({}); mail sync will continue",
+                                ex.what()
+                            );
+                        } catch (...) {
+                            spdlog::get("logger")->warn(
+                                "Manual calendar sync failed; mail sync will continue"
+                            );
+                        }
                         runningCalendarSync = false;
+                    }).detach();
+                }
+            }
+
+            if (type == "sync-contacts") {
+                static atomic<bool> runningContactsSync { false };
+                bool expected = false;
+                if (runningContactsSync.compare_exchange_strong(expected, true)) {
+                    std::thread([account]() {
+                        SetThreadName("contacts");
+                        try {
+                            auto worker = DAVWorker(account);
+                            worker.runContacts();
+                        } catch (SyncException & ex) {
+                            spdlog::get("logger")->warn(
+                                "Manual contact sync failed ({}); mail sync will continue",
+                                ex.key
+                            );
+                        } catch (std::exception & ex) {
+                            spdlog::get("logger")->warn(
+                                "Manual contact sync failed ({}); mail sync will continue",
+                                ex.what()
+                            );
+                        } catch (...) {
+                            spdlog::get("logger")->warn(
+                                "Manual contact sync failed; mail sync will continue"
+                            );
+                        }
+                        runningContactsSync = false;
                     }).detach();
                 }
             }
@@ -749,16 +831,6 @@ string exectuablePath = argv[0];
 
     // Note: On Windows, SASL plugin path is configured in libetpan's mailsasl.c
     // It defaults to the executable directory, but can be overridden via SASL_PATH env var.
-
-#ifndef DEBUG
-    // check path to executable in an obtuse way, prevent re-use of
-    // Mailspring-Sync in products / forks not called Mailspring.
-    transform(exectuablePath.begin(), exectuablePath.end(), exectuablePath.begin(), ::tolower);
-    string headerMessageId = string(USAGE_STRING).substr(59, 4) + string(USAGE_IDENTITY).substr(33, 6);
-    if (exectuablePath.find(headerMessageId) == string::npos) {
-        return 2;
-    }
-#endif
 
     // initialize the stanford exception handler
     exceptions::setProgramNameForStackTrace(exectuablePath.c_str());
@@ -920,6 +992,13 @@ string exectuablePath = argv[0];
 
     if (mode == "test") {
         return runTestAuth(account);
+    }
+
+    if (mode == "contacts") {
+        return runSingleFunctionAndExit([&]() {
+            DAVWorker worker(account);
+            worker.runContacts();
+        });
     }
 
     if (mode == "sync") {

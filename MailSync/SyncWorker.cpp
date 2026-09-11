@@ -6,9 +6,11 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 #include <algorithm>
+#include <functional>
+#include <iomanip>
 #include <set>
 
 #include "SyncWorker.hpp"
@@ -23,6 +25,9 @@
 #include "constants.h"
 #include "ProgressCollectors.hpp"
 #include "SyncException.hpp"
+#include "NetworkRequestUtils.hpp"
+#include "XOAuth2TokenManager.hpp"
+#include "FolderSyncPolicy.hpp"
 
 
 #define CACHE_CLEANUP_INTERVAL      60 * 60
@@ -30,6 +35,7 @@
 #define DEEP_SCAN_INTERVAL          60 * 10
 
 #define MAX_FULL_HEADERS_REQUEST_SIZE  1024
+#define FULL_HEADERS_BATCH_SIZE        100
 #define MODSEQ_TRUNCATION_THRESHOLD 4000
 #define MODSEQ_TRUNCATION_UID_COUNT 12000
 
@@ -47,15 +53,97 @@
 #define LS_HIGHESTMODSEQ            "highestmodseq"
 #define LS_UIDVALIDITY              "uidvalidity"
 #define LS_UIDVALIDITY_RESET_COUNT  "uidvalidityResetCount"
+#define LS_MESSAGE_COUNT            "messageCount"
 
 using namespace mailcore;
 using namespace std;
+
+static string graphUrlEncode(const string & value) {
+    CURL *curl = curl_easy_init();
+    char *encoded = curl_easy_escape(curl, value.c_str(), (int)value.size());
+    string result = encoded ? encoded : "";
+    if (encoded) curl_free(encoded);
+    curl_easy_cleanup(curl);
+    return result;
+}
+
+static uint32_t graphRemoteUID(const string & value) {
+    uint32_t hash = 2166136261u;
+    for (unsigned char c : value) {
+        hash ^= c;
+        hash *= 16777619u;
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+static time_t graphDate(const string & value) {
+    if (value.empty()) return time(0);
+    tm parsed = {};
+    istringstream input(value.substr(0, 19));
+    input >> get_time(&parsed, "%Y-%m-%dT%H:%M:%S");
+    if (input.fail()) return time(0);
+#if defined(_WIN32)
+    return _mkgmtime(&parsed);
+#else
+    return timegm(&parsed);
+#endif
+}
+
+static Address * graphAddress(const json & recipient) {
+    if (!recipient.is_object() || !recipient.count("emailAddress")) return nullptr;
+    const json & email = recipient["emailAddress"];
+    string address = email.value("address", "");
+    if (address.empty()) return nullptr;
+    string name = email.value("name", "");
+    return Address::addressWithDisplayName(AS_MCSTR(name), AS_MCSTR(address));
+}
+
+static Array * graphAddresses(const json & recipients) {
+    Array * result = new Array();
+    if (recipients.is_array()) {
+        for (const auto & recipient : recipients) {
+            Address * address = graphAddress(recipient);
+            if (address) result->addObject(address);
+        }
+    }
+    return result;
+}
+
+static IMAPMessage * graphMessage(const json & remote) {
+    IMAPMessage * message = new IMAPMessage();
+    const string graphId = remote.value("id", "");
+    message->setUid(graphRemoteUID(graphId));
+
+    MessageFlag flags = MessageFlagNone;
+    if (remote.value("isRead", false)) flags = (MessageFlag)(flags | MessageFlagSeen);
+    if (remote.value("isDraft", false)) flags = (MessageFlag)(flags | MessageFlagDraft);
+    if (remote.count("flag") && remote["flag"].value("flagStatus", "") == "flagged") {
+        flags = (MessageFlag)(flags | MessageFlagFlagged);
+    }
+    message->setFlags(flags);
+
+    MessageHeader * header = message->header();
+    string messageId = remote.value("internetMessageId", "");
+    if (messageId.empty()) messageId = "graph-" + graphId;
+    header->setMessageID(AS_MCSTR(messageId));
+    header->setSubject(AS_MCSTR(remote.value("subject", "No Subject")));
+    time_t received = graphDate(remote.value("receivedDateTime", ""));
+    header->setDate(received);
+    header->setReceivedDate(received);
+    if (remote.count("from")) header->setFrom(graphAddress(remote["from"]));
+    header->setTo(graphAddresses(remote.value("toRecipients", json::array())));
+    header->setCc(graphAddresses(remote.value("ccRecipients", json::array())));
+    header->setBcc(graphAddresses(remote.value("bccRecipients", json::array())));
+    header->setReplyTo(graphAddresses(remote.value("replyTo", json::array())));
+    return message;
+}
 
 
 SyncWorker::SyncWorker(shared_ptr<Account> account) :
     store(new MailStore()),
     account(account),
     unlinkPhase(1),
+    iterationsSinceLaunch(0),
     logger(spdlog::get("logger")),
     processor(new MailProcessor(account, store)),
     session(IMAPSession())
@@ -65,10 +153,16 @@ SyncWorker::SyncWorker(shared_ptr<Account> account) :
 
 void SyncWorker::configure()
 {
+    if (account->usesMicrosoftGraph()) return;
     // For accounts connecting with XOAuth2, this function may
     // make HTTP requests so it's important this function is called
     // within the thread retry handlers.
     MailUtils::configureSessionForAccount(session, account);
+}
+
+bool SyncWorker::supportsIdle()
+{
+    return account->usesMicrosoftGraph() || session.isIdleEnabled();
 }
 
 void SyncWorker::idleInterrupt()
@@ -91,6 +185,25 @@ void SyncWorker::idleQueueBodiesToSync(vector<string> & ids) {
 
 void SyncWorker::idleCycleIteration()
 {
+    if (account->usesMicrosoftGraph()) {
+        while (true) {
+            string id;
+            {
+                std::unique_lock<std::mutex> lck(idleMtx);
+                if (idleFetchBodyIDs.empty()) break;
+                id = idleFetchBodyIDs.back();
+                idleFetchBodyIDs.pop_back();
+            }
+            auto message = store->find<Message>(Query().equal("id", id));
+            if (message) syncMicrosoftGraphMessageBody(message.get());
+        }
+        TaskProcessor taskProcessor { account, store, nullptr };
+        taskProcessor.cleanupOldTasksAtRuntime();
+        auto tasks = store->findAll<Task>(Query().equal("accountId", account->id()).equal("status", "remote"));
+        for (auto & task : tasks) taskProcessor.performRemote(task.get());
+        MailUtils::sleepWorkerUntilWakeOrSec(30);
+        return;
+    }
     // Run body requests from the client
     while (true) {
         string id;
@@ -229,6 +342,16 @@ void SyncWorker::idleCycleIteration()
         String path = AS_MCSTR(inbox->path());
         IMAPFolderStatus remoteStatus = session.folderStatus(&path, &err);
 
+        if (err != ErrorCode::ErrorNone) {
+            throw SyncException(err, "idleCycleIteration - folderStatus");
+        }
+        if (!FolderSyncPolicy::statusIsUsable(remoteStatus.uidValidity(), remoteStatus.uidNext())) {
+            throw SyncException(
+                "invalid-folder-status",
+                "The IMAP server returned an unusable folder status for " + inbox->path(),
+                true);
+        }
+
         // Note: If we have CONDSTORE but don't have QRESYNC, this if/else may result
         // in us not seeing "vanished" messages until the next shallow sync iteration.
         // Right now I think that's fine.
@@ -295,6 +418,7 @@ void SyncWorker::markAllFoldersBusy() {
 bool SyncWorker::syncNow()
 {
     AutoreleasePool pool;
+    if (account->usesMicrosoftGraph()) return syncMicrosoftGraphMessages();
     bool syncAgainImmediately = false;
 
     vector<shared_ptr<Folder>> folders = syncFoldersAndLabels();
@@ -333,6 +457,12 @@ bool SyncWorker::syncNow()
             logger->warn("SyncNow: unable to get folder status for {} ({}), skipping...", folder->path(), ErrorCodeToTypeMap[err]);
             continue;
         }
+        if (!FolderSyncPolicy::statusIsUsable(remoteStatus.uidValidity(), remoteStatus.uidNext())) {
+            logger->warn(
+                "SyncNow: IMAP server returned an unusable folder status for {} (uidvalidity={}, uidnext={}), skipping...",
+                folder->path(), remoteStatus.uidValidity(), remoteStatus.uidNext());
+            continue;
+        }
         
         // Step 1: Check folder UIDValidity
         if (localStatus.empty() || localStatus[LS_UIDVALIDITY].is_null()) {
@@ -346,6 +476,7 @@ bool SyncWorker::syncNow()
             localStatus[LS_SYNCED_MIN_UID] = remoteStatus.uidNext();
             localStatus[LS_LAST_SHALLOW] = 0;
             localStatus[LS_LAST_DEEP] = 0;
+            localStatus[LS_MESSAGE_COUNT] = remoteStatus.messageCount();
             firstChunk = true;
         }
         
@@ -360,6 +491,7 @@ bool SyncWorker::syncNow()
             localStatus[LS_BODIES_WANTED] = 0; // pretend we want no message contents
             localStatus[LS_SYNCED_MIN_UID] = 1; // pretend we have scanned all the way to the oldest message
             localStatus[LS_UIDNEXT] = remoteStatus.uidNext();
+            localStatus[LS_MESSAGE_COUNT] = remoteStatus.messageCount();
             store->saveFolderStatus(folder.get(), initialLocalStatus);
             continue;
         }
@@ -370,7 +502,7 @@ bool SyncWorker::syncNow()
             //
             // 1) Set remoteUID to the "UNLINKED" value for every message in the folder
             // 2) Run a 'deep' scan which will refetch the metadata for the messages,
-            //    compute the Mailspring message IDs and re-map local models to remote UIDs.
+            //    compute the SummerMail message IDs and re-map local models to remote UIDs.
             //
             // Notes:
             // - It's very important that this not generate deltas - because we're only changing
@@ -396,6 +528,7 @@ bool SyncWorker::syncNow()
             localStatus[LS_SYNCED_MIN_UID] = 1;
             localStatus[LS_LAST_SHALLOW] = time(0);
             localStatus[LS_LAST_DEEP] = time(0);
+            localStatus[LS_MESSAGE_COUNT] = remoteStatus.messageCount();
             
             store->saveFolderStatus(folder.get(), initialLocalStatus);
             continue;
@@ -421,17 +554,28 @@ bool SyncWorker::syncNow()
         
         // Step 3: A) Retrieve new messages  B) update existing messages  C) delete missing messages
         // CONDSTORE, when available, does A + B.
-        // XYZRESYNC, when available, does C
-        if (hasCondstore && hasQResync) {
-            // Hooray! We never need to fetch the entire range to sync. Just look at
-            // highestmodseq / uidnext and sync if we need to.
+        // QRESYNC, when available, does C.
+        bool hasSavedMessageCount = localStatus.count(LS_MESSAGE_COUNT) > 0 &&
+                                    localStatus[LS_MESSAGE_COUNT].is_number_unsigned();
+        uint32_t savedMessageCount = hasSavedMessageCount
+            ? localStatus[LS_MESSAGE_COUNT].get<uint32_t>()
+            : remoteStatus.messageCount();
+        bool folderCountChanged = FolderSyncPolicy::shouldForceShallowScan(
+            hasQResync, hasSavedMessageCount, savedMessageCount, remoteStatus.messageCount());
+
+        if (hasCondstore) {
+            // CONDSTORE handles new messages and flag changes even when QRESYNC is
+            // unavailable. QRESYNC only determines whether removals are included.
             syncFolderChangesViaCondstore(*folder, remoteStatus, true);
-        } else {
+        }
+
+        if (!hasQResync) {
             uint32_t remoteUidnext = remoteStatus.uidNext();
             uint32_t localUidnext = localStatus[LS_UIDNEXT].get<uint32_t>();
-            bool newMessages = remoteUidnext > localUidnext;
+            bool newMessages = !hasCondstore && remoteUidnext > localUidnext;
             bool timeForDeepScan = (iterationsSinceLaunch > 0) && (time(0) - localStatus[LS_LAST_DEEP].get<time_t>() > DEEP_SCAN_INTERVAL);
-            bool timeForShallowScan = !timeForDeepScan && (time(0) - localStatus[LS_LAST_SHALLOW].get<time_t>() > SHALLOW_SCAN_INTERVAL);
+            bool timeForShallowScan = !timeForDeepScan &&
+                (folderCountChanged || time(0) - localStatus[LS_LAST_SHALLOW].get<time_t>() > SHALLOW_SCAN_INTERVAL);
 
             // Okay. If there are new messages in the folder (UIDnext has increased), do a heavy fetch of
             // those /AND/ get the bodies. This ensures people see both very quickly, which is important.
@@ -481,6 +625,8 @@ bool SyncWorker::syncNow()
                 localStatus[LS_UIDNEXT] = remoteUidnext;
             }
         }
+
+        localStatus[LS_MESSAGE_COUNT] = remoteStatus.messageCount();
         
         bool moreToDo = false;
 
@@ -525,7 +671,7 @@ bool SyncWorker::syncNow()
     return syncAgainImmediately;
 }
 
-void SyncWorker::ensureRootMailspringFolder(vector<string> containerFolderComponents, Array * remoteFolders)
+void SyncWorker::ensureRootSummerMailFolder(vector<string> containerFolderComponents, Array * remoteFolders)
 {
     auto components = Array::array();
     for (string containerFolderComponent : containerFolderComponents) {
@@ -546,24 +692,168 @@ void SyncWorker::ensureRootMailspringFolder(vector<string> containerFolderCompon
         ErrorCode err = ErrorCode::ErrorNone;
         session.createFolder(desiredPath, &err);
         if (err) {
-            logger->error("Could not create Mailspring container folder: {}. {}", desiredPath->UTF8Characters(), ErrorCodeToTypeMap[err]);
+            logger->error("Could not create SummerMail container folder: {}. {}", desiredPath->UTF8Characters(), ErrorCodeToTypeMap[err]);
         } else {
-            logger->error("Created Mailspring container folder: {}.", desiredPath->UTF8Characters());
+            logger->error("Created SummerMail container folder: {}.", desiredPath->UTF8Characters());
         }
     }
+}
+
+vector<shared_ptr<Folder>> SyncWorker::syncMicrosoftGraphFolders()
+{
+    logger->info("Syncing Microsoft Graph folder list...");
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    const vector<pair<string, string>> knownFolders = {
+        {"inbox", "inbox"}, {"archive", "archive"}, {"drafts", "drafts"},
+        {"sentitems", "sent"}, {"deleteditems", "trash"}, {"junkemail", "spam"}
+    };
+
+    map<string, string> rolesByGraphId;
+    for (const auto & known : knownFolders) {
+        string url = MicrosoftGraphBaseURL(account) + "/mailFolders/" + known.first +
+            "?$select=id";
+        json remote = PerformJSONRequest(CreateMicrosoftGraphRequest(url, "GET", token));
+        string graphId = remote.value("id", "");
+        if (!graphId.empty()) rolesByGraphId[graphId] = known.second;
+    }
+
+    vector<shared_ptr<Folder>> folders;
+    vector<pair<string, string>> pages = {{
+        MicrosoftGraphBaseURL(account) + "/mailFolders?$top=100&includeHiddenFolders=true&$select=id,displayName,totalItemCount,unreadItemCount,parentFolderId,childFolderCount",
+        ""
+    }};
+    for (size_t pageIndex = 0; pageIndex < pages.size(); pageIndex++) {
+        json response = PerformJSONRequest(CreateMicrosoftGraphRequest(pages[pageIndex].first, "GET", token));
+        if (!response.count("value") || !response["value"].is_array()) continue;
+        MailStoreTransaction transaction(store, "syncMicrosoftGraphFolders");
+        for (const auto & remote : response["value"]) {
+            string graphId = remote.value("id", "");
+            if (graphId.empty()) continue;
+            string displayName = remote.value("displayName", "Folder");
+            string path = pages[pageIndex].second.empty()
+                ? displayName : pages[pageIndex].second + "/" + displayName;
+            string localId = MailUtils::idForFolder(account->id(), "graph:" + graphId);
+            auto local = store->find<Folder>(Query().equal("id", localId));
+            if (!local) local = make_shared<Folder>(localId, account->id(), 0);
+            local->setPath(path);
+            local->setRole(rolesByGraphId.count(graphId) ? rolesByGraphId[graphId] : "");
+            local->localStatus()["graphId"] = graphId;
+            local->localStatus()["graphParentId"] = remote.value("parentFolderId", "");
+            local->localStatus()["total"] = remote.value("totalItemCount", 0);
+            local->localStatus()["unread"] = remote.value("unreadItemCount", 0);
+            local->localStatus()[LS_BUSY] = false;
+            store->save(local.get());
+            folders.push_back(local);
+
+            if (remote.value("childFolderCount", 0) > 0) {
+                pages.push_back({
+                    MicrosoftGraphBaseURL(account) + "/mailFolders/" + graphUrlEncode(graphId) +
+                        "/childFolders?$top=100&includeHiddenFolders=true&$select=id,displayName,totalItemCount,unreadItemCount,parentFolderId,childFolderCount",
+                    path
+                });
+            }
+        }
+        transaction.commit();
+        if (response.count("@odata.nextLink") && response["@odata.nextLink"].is_string()) {
+            pages.push_back({response["@odata.nextLink"].get<string>(), pages[pageIndex].second});
+        }
+    }
+    return folders;
+}
+
+bool SyncWorker::syncMicrosoftGraphMessages()
+{
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    auto folders = store->findAll<Folder>(Query().equal("accountId", account->id()));
+    bool hasMoreInitialPages = false;
+
+    for (auto & folder : folders) {
+        json & status = folder->localStatus();
+        if (!status.count("graphId") || !status["graphId"].is_string()) continue;
+
+        string url;
+        if (status.count("graphNextLink") && status["graphNextLink"].is_string() &&
+            !status["graphNextLink"].get<string>().empty()) {
+            url = status["graphNextLink"].get<string>();
+        } else if (status.count("graphDeltaLink") && status["graphDeltaLink"].is_string() &&
+                   !status["graphDeltaLink"].get<string>().empty()) {
+            url = status["graphDeltaLink"].get<string>();
+        } else {
+            url = MicrosoftGraphBaseURL(account) + "/mailFolders/" +
+                graphUrlEncode(status["graphId"].get<string>()) +
+                "/messages/delta?$top=100&$select=id,internetMessageId,conversationId,subject,from,toRecipients,ccRecipients,bccRecipients,replyTo,receivedDateTime,isRead,flag,bodyPreview,hasAttachments,isDraft,parentFolderId";
+        }
+
+        json response = PerformJSONRequest(CreateMicrosoftGraphRequest(url, "GET", token));
+        if (!response.count("value") || !response["value"].is_array()) continue;
+
+        // MailProcessor owns the transaction for each insert/update. Do not wrap
+        // the Graph page in another transaction: SQLite does not support nested
+        // BEGIN statements, and insertFallbackToUpdateMessage() deliberately
+        // starts its own transaction to keep thread/message updates atomic.
+        for (const auto & remote : response["value"]) {
+            string graphId = remote.value("id", "");
+            if (graphId.empty()) continue;
+            if (remote.count("@removed")) {
+                auto localMessages = store->findAll<Message>(Query().equal("accountId", account->id()).equal("remoteFolderId", folder->id()));
+                for (auto & local : localMessages) {
+                    if (local->graphId() == graphId) {
+                        store->remove(local.get());
+                        break;
+                    }
+                }
+                continue;
+            }
+            IMAPMessage * graph = graphMessage(remote);
+            auto local = processor->insertFallbackToUpdateMessage(graph, *folder, time(0));
+            local->setGraphId(graphId);
+            local->setSnippet(remote.value("bodyPreview", ""));
+            local->setSyncedAt(time(0));
+            store->save(local.get());
+            graph->release();
+        }
+
+        if (response.count("@odata.nextLink") && response["@odata.nextLink"].is_string()) {
+            status["graphNextLink"] = response["@odata.nextLink"];
+            hasMoreInitialPages = true;
+        } else {
+            status["graphNextLink"] = "";
+            if (response.count("@odata.deltaLink") && response["@odata.deltaLink"].is_string()) {
+                status["graphDeltaLink"] = response["@odata.deltaLink"];
+            }
+        }
+        store->save(folder.get());
+    }
+    return hasMoreInitialPages;
+}
+
+void SyncWorker::syncMicrosoftGraphMessageBody(Message * message)
+{
+    string graphId = message->graphId();
+    if (graphId.empty()) return;
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
+    string url = MicrosoftGraphBaseURL(account) + "/messages/" + graphUrlEncode(graphId) + "/$value";
+    CURL * request = CreateMicrosoftGraphRequest(url, "GET", token);
+    string raw = PerformRequest(request);
+    CleanupCurlRequest(request);
+    Data * data = Data::dataWithBytes(raw.c_str(), (unsigned int)raw.size());
+    MessageParser * parser = MessageParser::messageParserWithData(data);
+    if (!parser) throw SyncException("invalid-graph-message", "Microsoft Graph returned invalid MIME content.", true);
+    processor->retrievedMessageBody(message, parser);
 }
 
 vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
 {
     // allocated mailcore objects freed when `pool` is removed from the stack
     AutoreleasePool pool;
+    if (account->usesMicrosoftGraph()) return syncMicrosoftGraphFolders();
 
     string containerFolderPath = account->containerFolder();
     vector<string> containerFolderComponents;
 
-    if (containerFolderPath == "" || containerFolderPath == MAILSPRING_FOLDER_PREFIX_V2) {
+    if (containerFolderPath == "" || containerFolderPath == SUMMERMAIL_FOLDER_PREFIX_V2) {
       logger->info("Syncing folder list...");
-      containerFolderComponents.push_back(MAILSPRING_FOLDER_PREFIX_V2);
+      containerFolderComponents.push_back(SUMMERMAIL_FOLDER_PREFIX_V2);
     } else {
       logger->info("Syncing folder list on custom container folder {} ...", containerFolderPath);
 
@@ -584,33 +874,33 @@ vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
     string mainPrefix = MailUtils::namespacePrefixOrBlank(&session);
     bool ensuredRoot = false;
     
-    // create required Mailspring folders if they don't exist
+    // create required SummerMail folders if they don't exist
     // TODO: Consolidate this into role association code below, and make it
     // use the same business logic as creating / updating folders from tasks.
     // Accounts with create_helper_folders=false (e.g. O365 shared mailboxes, where
     // any folder we create is visible to every member of the mailbox) are skipped;
     // features depending on these folders (snooze) are unavailable there.
-    vector<string> mailspringFolders{};
+    vector<string> summermailFolders{};
     if (account->createHelperFolders()) {
-        mailspringFolders.push_back("Snoozed");
+        summermailFolders.push_back("Snoozed");
     }
 
-    for (string mailspringFolder : mailspringFolders) {
-        string mailspringRole = mailspringFolder;
-        transform(mailspringRole.begin(), mailspringRole.end(), mailspringRole.begin(), ::tolower);
+    for (string summermailFolder : summermailFolders) {
+        string summermailRole = summermailFolder;
+        transform(summermailRole.begin(), summermailRole.end(), summermailRole.begin(), ::tolower);
 
         bool exists = false;
         for (int ii = ((int)remoteFolders->count()) - 1; ii >= 0; ii--) {
             IMAPFolder * remote = (IMAPFolder *)remoteFolders->objectAtIndex(ii);
             string remoteRole = MailUtils::roleForFolder(containerFolderPath, mainPrefix, remote);
-            if (remoteRole == mailspringRole) {
+            if (remoteRole == summermailRole) {
                 exists = true;
                 break;
             }
         }
         if (!exists) {
             if (!ensuredRoot) {
-                ensureRootMailspringFolder(containerFolderComponents, remoteFolders);
+                ensureRootSummerMailFolder(containerFolderComponents, remoteFolders);
                 ensuredRoot = true;
             }
             
@@ -618,14 +908,14 @@ vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
             for (string containerFolderComponent : containerFolderComponents) {
               components->addObject(AS_MCSTR(containerFolderComponent));
             }
-            components->addObject(AS_MCSTR(mailspringFolder));
+            components->addObject(AS_MCSTR(summermailFolder));
             String * desiredPath = session.defaultNamespace()->pathForComponents(components);
             session.createFolder(desiredPath, &err);
             if (err) {
-                logger->error("Could not create required Mailspring folder: {}. {}", desiredPath->UTF8Characters(), ErrorCodeToTypeMap[err]);
+                logger->error("Could not create required SummerMail folder: {}. {}", desiredPath->UTF8Characters(), ErrorCodeToTypeMap[err]);
                 continue;
             }
-            logger->error("Created required Mailspring folder: {}.", desiredPath->UTF8Characters());
+            logger->error("Created required SummerMail folder: {}.", desiredPath->UTF8Characters());
             IMAPFolder * fake = new IMAPFolder();
             fake->autorelease();
             fake->setPath(desiredPath);
@@ -819,7 +1109,7 @@ void SyncWorker::syncFolderUIDRange(Folder & folder, Range range, bool heavyInit
 
     AutoreleasePool pool;
     IndexSet * set = IndexSet::indexSetWithRange(range);
-    IndexSet * heavyNeeded = IndexSet::indexSet();
+    vector<uint32_t> heavyNeededUIDs {};
     IMAPProgress cb;
     ErrorCode err(ErrorCode::ErrorNone);
     String path(AS_MCSTR(remotePath));
@@ -834,7 +1124,9 @@ void SyncWorker::syncFolderUIDRange(Folder & folder, Range range, bool heavyInit
 
     // Step 2: Fetch the remote attributes (unread, starred, etc.) for the same UID range
     time_t syncDataTimestamp = time(0);
-    auto kind = MailUtils::messagesRequestKindFor(session.storedCapabilities(), heavyInitialRequest);
+    // Always discover changes with a lightweight FLAGS request first. Full-header requests are
+    // performed below in retryable batches so one malformed message cannot reject the entire range.
+    auto kind = MailUtils::messagesRequestKindFor(session.storedCapabilities(), false);
     Array * remote = session.fetchMessagesByUID(&path, kind, set, &cb, &err);
     if (err) {
         throw SyncException(err, "syncFolderUIDRange - fetchMessagesByUID");
@@ -868,24 +1160,17 @@ void SyncWorker::syncFolderUIDRange(Folder & folder, Range range, bool heavyInit
             // but we can only query for 500 at a time, it /feels/ nasty, and we /could/ always
             // hit the exception anyway since another thread could be IDLEing and retrieving
             // the messages alongside us.
-            if (heavyInitialRequest) {
-                auto local = processor->insertFallbackToUpdateMessage(remoteMsg, folder, syncDataTimestamp);
-                if (syncedMessages != nullptr) {
-                    syncedMessages->push_back(local);
-                }
-            } else {
-                if (heavyNeededIdeal < MAX_FULL_HEADERS_REQUEST_SIZE) {
-                    heavyNeeded->addIndex(remoteUID);
-                }
-                heavyNeededIdeal += 1;
+            if (heavyNeededIdeal < MAX_FULL_HEADERS_REQUEST_SIZE) {
+                heavyNeededUIDs.push_back(remoteUID);
             }
+            heavyNeededIdeal += 1;
         }
         
         local.erase(remoteUID);
     }
     
-    if (!heavyInitialRequest && heavyNeeded->count() > 0) {
-        logger->info("- Fetching full headers for {} (of {} needed)", heavyNeeded->count(), heavyNeededIdeal);
+    if (heavyNeededUIDs.size() > 0) {
+        logger->info("- Fetching full headers for {} (of {} needed)", heavyNeededUIDs.size(), heavyNeededIdeal);
 
         // Note: heavyNeeded could be enormous if the user added a zillion items to a folder, if it's been
         // years since the app was launched, or if a sync bug caused us to delete messages we shouldn't have.
@@ -896,18 +1181,47 @@ void SyncWorker::syncFolderUIDRange(Folder & folder, Range range, bool heavyInit
         // sync X more.
         //
         syncDataTimestamp = time(0);
-        auto kind = MailUtils::messagesRequestKindFor(session.storedCapabilities(), true);
-        remote = session.fetchMessagesByUID(&path, kind, heavyNeeded, &cb, &err);
-        if (err != ErrorNone) {
-            throw SyncException(err, "syncFolderUIDRange - fetchMessagesByUID (heavy)");
-        }
-        for (int ii = ((int)remote->count()) - 1; ii >= 0; ii--) {
-            IMAPMessage * remoteMsg = (IMAPMessage *)(remote->objectAtIndex(ii));
-            auto local = processor->insertFallbackToUpdateMessage(remoteMsg, folder, syncDataTimestamp);
-            if (syncedMessages != nullptr) {
-                syncedMessages->push_back(local);
+        auto heavyKind = MailUtils::messagesRequestKindFor(session.storedCapabilities(), true);
+
+        std::function<void(const vector<uint32_t> &)> fetchHeavyBatch;
+        fetchHeavyBatch = [&](const vector<uint32_t> & batch) {
+            IndexSet * batchSet = IndexSet::indexSet();
+            for (uint32_t uid : batch) {
+                batchSet->addIndex(uid);
             }
-            remote->removeLastObject();
+
+            ErrorCode fetchErr(ErrorCode::ErrorNone);
+            Array * batchRemote = session.fetchMessagesByUID(&path, heavyKind, batchSet, &cb, &fetchErr);
+            if (fetchErr == ErrorCode::ErrorParse) {
+                if (batch.size() == 1) {
+                    logger->error("- Could not parse full headers for UID {} in {}; deferring only this message", batch[0], remotePath);
+                    return;
+                }
+
+                size_t midpoint = batch.size() / 2;
+                vector<uint32_t> left(batch.begin(), batch.begin() + midpoint);
+                vector<uint32_t> right(batch.begin() + midpoint, batch.end());
+                logger->warn("- Full-header fetch failed to parse for {} UIDs in {}; retrying as {} and {}", batch.size(), remotePath, left.size(), right.size());
+                fetchHeavyBatch(left);
+                fetchHeavyBatch(right);
+                return;
+            }
+            if (fetchErr != ErrorNone) {
+                throw SyncException(fetchErr, "syncFolderUIDRange - fetchMessagesByUID (heavy)");
+            }
+
+            for (int ii = ((int)batchRemote->count()) - 1; ii >= 0; ii--) {
+                IMAPMessage * remoteMsg = (IMAPMessage *)(batchRemote->objectAtIndex(ii));
+                auto local = processor->insertFallbackToUpdateMessage(remoteMsg, folder, syncDataTimestamp);
+                if (syncedMessages != nullptr) {
+                    syncedMessages->push_back(local);
+                }
+            }
+        };
+
+        vector<uint32_t> remainingUIDs = heavyNeededUIDs;
+        for (vector<uint32_t> batch : MailUtils::chunksOfVector(remainingUIDs, FULL_HEADERS_BATCH_SIZE)) {
+            fetchHeavyBatch(batch);
         }
     }
 
@@ -962,7 +1276,30 @@ void SyncWorker::syncFolderChangesViaCondstore(Folder & folder, IMAPFolderStatus
     
     auto kind = MailUtils::messagesRequestKindFor(session.storedCapabilities(), true);
     IMAPSyncResult * result = session.syncMessagesByUID(&path, kind, uids, modseq, &cb, &err);
-    if (err != ErrorCode::ErrorNone) {
+    bool flagsOnlyFallback = false;
+    bool gmailFlagsFallback = false;
+
+    // A malformed header in a single changed message can make libetpan reject the
+    // entire FETCH response. Retrying the same CHANGEDSINCE request without headers
+    // still lets us apply flag changes (notably \\Seen) to messages already stored
+    // locally. This keeps read state synchronized while leaving the folder checkpoint
+    // unchanged if the response also contains a new message whose headers we need.
+    if (err == ErrorCode::ErrorParse) {
+        logger->warn("syncFolderChangesViaCondstore - full fetch failed to parse for {}; retrying flags only", folder.path());
+        ErrorCode fallbackErr = ErrorCode::ErrorNone;
+        auto flagsKind = MailUtils::messagesRequestKindFor(session.storedCapabilities(), false);
+        gmailFlagsFallback = session.storedCapabilities()->containsIndex(IMAPCapabilityGmail);
+        if (gmailFlagsFallback) {
+            // Gmail messages may be stored locally under All Mail while this worker
+            // IDLEs on Inbox, so folder + UID is not a stable cross-folder key.
+            flagsKind = IMAPMessagesRequestKind(flagsKind | IMAPMessagesRequestKindGmailMessageID);
+        }
+        result = session.syncMessagesByUID(&path, flagsKind, uids, modseq, &cb, &fallbackErr);
+        if (fallbackErr != ErrorCode::ErrorNone) {
+            throw SyncException(err, "syncFolderChangesViaCondstore - syncMessagesByUID");
+        }
+        flagsOnlyFallback = true;
+    } else if (err != ErrorCode::ErrorNone) {
         throw SyncException(err, "syncFolderChangesViaCondstore - syncMessagesByUID");
     }
 
@@ -973,14 +1310,27 @@ void SyncWorker::syncFolderChangesViaCondstore(Folder & folder, IMAPFolderStatus
     logger->info("syncFolderChangesViaCondstore - Changes since HMODSEQ {}: {} changed, {} vanished",
                  modseq, modifiedOrAdded->count(), (vanished != nullptr) ? vanished->count() : 0);
 
+    unsigned int unresolvedMessages = 0;
     for (unsigned int ii = 0; ii < modifiedOrAdded->count(); ii ++) {
         IMAPMessage * msg = (IMAPMessage *)modifiedOrAdded->objectAtIndex(ii);
-        string id = MailUtils::idForMessage(folder.accountId(), folder.path(), msg);
-
-        Query query = Query().equal("id", id);
+        Query query;
+        if (gmailFlagsFallback) {
+            query = Query().equal("accountId", folder.accountId()).equal("gMsgId", to_string(msg->gmailMessageID()));
+        } else if (flagsOnlyFallback) {
+            query = Query().equal("remoteFolderId", folder.id()).equal("remoteUID", msg->uid());
+        } else {
+            string id = MailUtils::idForMessage(folder.accountId(), folder.path(), msg);
+            query = Query().equal("id", id);
+        }
         auto local = store->find<Message>(query);
         
         if (local == nullptr) {
+            if (flagsOnlyFallback) {
+                // Headers were intentionally omitted, so this message cannot be
+                // constructed yet. Preserve the old checkpoint and retry later.
+                unresolvedMessages += 1;
+                continue;
+            }
             // Found message with an ID we've never seen in any folder. Add it!
             processor->insertFallbackToUpdateMessage(msg, folder, syncDataTimestamp);
         } else {
@@ -1000,8 +1350,12 @@ void SyncWorker::syncFolderChangesViaCondstore(Folder & folder, IMAPFolderStatus
         }
     }
 
-    folder.localStatus()[LS_UIDNEXT] = remoteUIDNext;
-    folder.localStatus()[LS_HIGHESTMODSEQ] = remoteModseq;
+    if (unresolvedMessages == 0) {
+        folder.localStatus()[LS_UIDNEXT] = remoteUIDNext;
+        folder.localStatus()[LS_HIGHESTMODSEQ] = remoteModseq;
+    } else {
+        logger->warn("syncFolderChangesViaCondstore - recovered flags for existing messages but deferred {} new messages with unparseable headers", unresolvedMessages);
+    }
 }
 
 void SyncWorker::cleanMessageCache(Folder & folder) {

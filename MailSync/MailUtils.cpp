@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "MailUtils.hpp"
@@ -373,26 +373,38 @@ string MailUtils::roleForFolderViaPath(string containerFolderPath, string mainPr
     transform(path.begin(), path.end(), path.begin(), ::tolower);
     transform(containerFolderPath.begin(), containerFolderPath.end(), containerFolderPath.begin(), ::tolower);
 
-    // In our [Mailspring] subfolder, folder names are roles:
-    // [mailspring]/snoozed = snoozed
-    // [mailspring]/XXX = xxx
-    string mailspringPrefix = MAILSPRING_FOLDER_PREFIX_V1 + delimiter;
-    transform(mailspringPrefix.begin(), mailspringPrefix.end(), mailspringPrefix.begin(), ::tolower);
-    if (path.size() > mailspringPrefix.size() && path.substr(0, mailspringPrefix.size()) == mailspringPrefix) {
-        return path.substr(mailspringPrefix.size());
+    // In our [SummerMail] subfolder, folder names are roles:
+    // [summermail]/snoozed = snoozed
+    // [summermail]/XXX = xxx
+    string summermailPrefix = SUMMERMAIL_FOLDER_PREFIX_V1 + delimiter;
+    transform(summermailPrefix.begin(), summermailPrefix.end(), summermailPrefix.begin(), ::tolower);
+    if (path.size() > summermailPrefix.size() && path.substr(0, summermailPrefix.size()) == summermailPrefix) {
+        return path.substr(summermailPrefix.size());
     }
 
-           mailspringPrefix = MAILSPRING_FOLDER_PREFIX_V2 + delimiter;
-    transform(mailspringPrefix.begin(), mailspringPrefix.end(), mailspringPrefix.begin(), ::tolower);
-    if (path.size() > mailspringPrefix.size() && path.substr(0, mailspringPrefix.size()) == mailspringPrefix) {
-        return path.substr(mailspringPrefix.size());
+    summermailPrefix = LEGACY_MAIL_FOLDER_PREFIX_V1 + delimiter;
+    transform(summermailPrefix.begin(), summermailPrefix.end(), summermailPrefix.begin(), ::tolower);
+    if (path.size() > summermailPrefix.size() && path.substr(0, summermailPrefix.size()) == summermailPrefix) {
+        return path.substr(summermailPrefix.size());
+    }
+
+    summermailPrefix = LEGACY_MAIL_FOLDER_PREFIX_V2 + delimiter;
+    transform(summermailPrefix.begin(), summermailPrefix.end(), summermailPrefix.begin(), ::tolower);
+    if (path.size() > summermailPrefix.size() && path.substr(0, summermailPrefix.size()) == summermailPrefix) {
+        return path.substr(summermailPrefix.size());
+    }
+
+           summermailPrefix = SUMMERMAIL_FOLDER_PREFIX_V2 + delimiter;
+    transform(summermailPrefix.begin(), summermailPrefix.end(), summermailPrefix.begin(), ::tolower);
+    if (path.size() > summermailPrefix.size() && path.substr(0, summermailPrefix.size()) == summermailPrefix) {
+        return path.substr(summermailPrefix.size());
     }
 
     if (containerFolderPath != "") {
-           mailspringPrefix = containerFolderPath + delimiter;
-      transform(mailspringPrefix.begin(), mailspringPrefix.end(), mailspringPrefix.begin(), ::tolower);
-      if (path.size() > mailspringPrefix.size() && path.substr(0, mailspringPrefix.size()) == mailspringPrefix) {
-         return path.substr(mailspringPrefix.size());
+           summermailPrefix = containerFolderPath + delimiter;
+      transform(summermailPrefix.begin(), summermailPrefix.end(), summermailPrefix.begin(), ::tolower);
+      if (path.size() > summermailPrefix.size() && path.substr(0, summermailPrefix.size()) == summermailPrefix) {
+         return path.substr(summermailPrefix.size());
       }
     }
 
@@ -406,7 +418,7 @@ string MailUtils::roleForFolderViaPath(string containerFolderPath, string mainPr
 }
 
 int MailUtils::priorityForFolderRole(const string & role) {
-    // Mailspring's data model assumes each message exists in exactly one folder.
+    // SummerMail's data model assumes each message exists in exactly one folder.
     // However, some providers (notably iCloud) allow the same message to exist in
     // multiple folders simultaneously. When this happens, we use folder priority
     // to decide which folder "owns" the message, preventing it from flickering

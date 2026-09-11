@@ -4,7 +4,7 @@ This document describes the process for cherry-picking upstream bug fixes and im
 
 ## Overview
 
-The vendored libraries in `Vendor/` contain local modifications specific to Mailspring. When updating these libraries, we cherry-pick only relevant upstream commits rather than rebasing entirely, to avoid conflicts with local changes.
+The vendored libraries in `Vendor/` contain local modifications specific to SummerMail. When updating these libraries, we cherry-pick only relevant upstream commits rather than rebasing entirely, to avoid conflicts with local changes.
 
 ## Process
 

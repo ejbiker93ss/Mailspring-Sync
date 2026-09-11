@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 
 #include "ContactBook.hpp"
@@ -69,6 +69,14 @@ string ContactBook::syncToken() {
 
 void ContactBook::setSyncToken(string token) {
     _data["syncToken"] = token;
+}
+
+bool ContactBook::hasVerifiedListing() {
+    return _data.value("verifiedListingVersion", 0) >= 1;
+}
+
+void ContactBook::setVerifiedListing(bool verified) {
+    _data["verifiedListingVersion"] = verified ? 1 : 0;
 }
 
 vector<string> ContactBook::columnsForQuery() {

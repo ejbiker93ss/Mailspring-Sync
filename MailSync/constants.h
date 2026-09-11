@@ -6,7 +6,7 @@
 //  Copyright © 2017 Foundry 376. All rights reserved.
 //
 //  Use of this file is subject to the terms and conditions defined
-//  in 'LICENSE.md', which is part of the Mailspring-Sync package.
+//  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 #include <map>
 #include <libetpan/mailsmtp_types.h>
@@ -28,8 +28,10 @@ static string FS_PATH_SEP = "\\";
 static string FS_PATH_SEP = "/";
 #endif
 
-static string MAILSPRING_FOLDER_PREFIX_V1 = "[Mailspring]";
-static string MAILSPRING_FOLDER_PREFIX_V2 = "Mailspring";
+static string SUMMERMAIL_FOLDER_PREFIX_V1 = "[SummerMail]";
+static string SUMMERMAIL_FOLDER_PREFIX_V2 = "SummerMail";
+static string LEGACY_MAIL_FOLDER_PREFIX_V1 = "[Mailspring]";
+static string LEGACY_MAIL_FOLDER_PREFIX_V2 = "Mailspring";
 
 static vector<string> ACCOUNT_RESET_QUERIES = {
     "DELETE FROM `ThreadCounts` WHERE `categoryId` IN (SELECT id FROM `Folder` WHERE `accountId` = ?)",
@@ -110,6 +112,7 @@ static vector<string> V1_SETUP_QUERIES = {
     "CREATE INDEX IF NOT EXISTS ThreadGmailLookup ON `Thread` (gThrId) WHERE gThrId IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS ThreadIsSearchIndexedIndex ON `Thread` (isSearchIndexed, id)",
     "CREATE INDEX IF NOT EXISTS ThreadIsSearchIndexedLastMessageReceivedIndex ON `Thread` (isSearchIndexed, lastMessageReceivedTimestamp)",
+    "CREATE INDEX IF NOT EXISTS ThreadAccountSearchDateIndex ON `Thread` (accountId, lastMessageReceivedTimestamp DESC, id)",
 
     "CREATE TABLE IF NOT EXISTS ThreadReference ("
         "threadId VARCHAR(42),"
@@ -224,6 +227,11 @@ static vector<string> V9_SETUP_QUERIES = {
     "CREATE INDEX IF NOT EXISTS EventRecurrenceId ON Event(calendarId, icsuid, recurrenceId)",
 };
 
+// V10: Support account-scoped FTS result joins and date ordering without a full thread scan.
+static vector<string> V10_SETUP_QUERIES = {
+    "CREATE INDEX IF NOT EXISTS ThreadAccountSearchDateIndex ON `Thread` (accountId, lastMessageReceivedTimestamp DESC, id)",
+};
+
 static map<string, string> COMMON_FOLDER_NAMES = {
     {"gel\xc3\xb6scht", "trash"},
     {"papierkorb", "trash"},
@@ -290,6 +298,8 @@ static map<string, string> COMMON_FOLDER_NAMES = {
     {"draftbox", "drafts"},
     {"robocze", "drafts"},
 
+    {"SummerMail/Snoozed", "snoozed"},
+    {"SummerMail.Snoozed", "snoozed"},
     {"Mailspring/Snoozed", "snoozed"},
     {"Mailspring.Snoozed", "snoozed"},
 };
