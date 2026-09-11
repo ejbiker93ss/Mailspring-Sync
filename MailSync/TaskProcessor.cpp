@@ -28,6 +28,7 @@
 #include "SyncException.hpp"
 #include "NetworkRequestUtils.hpp"
 #include "XOAuth2TokenManager.hpp"
+#include "SmarterMailClient.hpp"
 
 #include <sstream>
 #include <algorithm>
@@ -543,15 +544,18 @@ void TaskProcessor::performRemote(Task * task) {
             task->setStatus("cancelled");
         } else {
             if (cname == "ChangeUnreadTask") {
-                if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
+                if (account->usesSmarterMailAPI()) performRemoteSmarterMailChange(task);
+                else if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
                 else performRemoteChangeOnMessages(task, false, _applyUnreadInIMAPFolder);
                 
             } else if (cname == "ChangeStarredTask") {
-                if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
+                if (account->usesSmarterMailAPI()) performRemoteSmarterMailChange(task);
+                else if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
                 else performRemoteChangeOnMessages(task, false, _applyStarredInIMAPFolder);
                 
             } else if (cname == "ChangeFolderTask") {
-                if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
+                if (account->usesSmarterMailAPI()) performRemoteSmarterMailChange(task);
+                else if (account->usesMicrosoftGraph()) performRemoteMicrosoftGraphChange(task);
                 else performRemoteChangeOnMessages(task, true, _applyFolderMoveInIMAPFolder);
 
             } else if (cname == "ChangeLabelsTask") {
@@ -914,6 +918,47 @@ void TaskProcessor::performRemoteMicrosoftGraphChange(Task * task) {
     transaction.commit();
 }
 
+void TaskProcessor::performRemoteSmarterMailChange(Task * task) {
+    json & data = task->data();
+    string cname = task->constructorName();
+    auto messages = inflateMessages(data).messages;
+    SmarterMailClient client(account);
+    shared_ptr<Folder> destination = nullptr;
+    if (cname == "ChangeFolderTask") {
+        destination = store->find<Folder>(Query().equal("id", data["folder"]["id"].get<string>()));
+        if (!destination) throw SyncException("invalid-smartermail-folder", "The SmarterMail destination folder is unavailable.", false);
+    }
+
+    map<string, vector<uint32_t>> uidsByFolder;
+    for (auto & message : messages) {
+        if (message->remoteUID() == 0 || message->remoteUID() > UINT32_MAX - 5) continue;
+        uidsByFolder[message->remoteFolder().value("path", "")].push_back(message->remoteUID());
+    }
+    for (const auto & entry : uidsByFolder) {
+        if (entry.first.empty() || entry.second.empty()) continue;
+        if (cname == "ChangeUnreadTask") client.markRead(entry.first, entry.second, !data["unread"].get<bool>());
+        else if (cname == "ChangeStarredTask") client.setFlagged(entry.first, entry.second, data["starred"].get<bool>());
+        else if (cname == "ChangeFolderTask") client.move(entry.first, entry.second, destination->path());
+    }
+
+    MailStoreTransaction transaction{store, "performRemoteSmarterMailChange"};
+    auto safeMessages = inflateMessages(data).messages;
+    for (auto & safe : safeMessages) {
+        if (destination) {
+            safe->setRemoteFolder(destination.get());
+            // SmarterMail UIDs are folder-local and a move may assign a new one.
+            // Mark it unlinked so the next successful listing reattaches by Message-ID.
+            safe->setRemoteUID(UINT32_MAX - 1);
+        }
+        int remaining = max(0, safe->syncUnsavedChanges() - 1);
+        safe->setSyncUnsavedChanges(remaining);
+        if (remaining == 0) safe->setSyncedAt(time(0));
+        store->save(safe.get());
+    }
+    store->unsafeEraseTransactionDeltas();
+    transaction.commit();
+}
+
 void TaskProcessor::performLocalSaveDraft(Task * task) {
     json & draftJSON = task->data()["draft"];
     
@@ -998,6 +1043,12 @@ void TaskProcessor::performRemoteDestroyDraft(Task * task) {
     for (auto & stub : stubs) {
         if (stub->remoteUID() == 0) {
             continue; // not synced to server at all
+        }
+        if (account->usesSmarterMailAPI()) {
+            SmarterMailClient client(account);
+            client.remove(stub->remoteFolder().value("path", ""), {stub->remoteUID()});
+            store->remove(stub.get());
+            continue;
         }
         if (account->usesMicrosoftGraph()) {
             if (!stub->graphId().empty()) {
@@ -1396,6 +1447,23 @@ void TaskProcessor::performRemoteSyncbackCategory(Task * task) {
     string path = data["path"].get<string>();
     string existingPath = data.count("existingPath") ? data["existingPath"].get<string>() : "";
 
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailClient client(account);
+        if (existingPath.empty()) client.createFolder(path);
+        else client.renameFolder(existingPath, path);
+        string localId = MailUtils::idForFolder(accountId, "smartermail:" + path);
+        auto localModel = existingPath.empty()
+            ? shared_ptr<Folder>()
+            : store->find<Folder>(Query().equal("accountId", accountId).equal("path", existingPath));
+        if (!localModel) localModel = make_shared<Folder>(localId, accountId, 0);
+        localModel->setPath(path);
+        localModel->setRole("");
+        localModel->localStatus()["smarterMailPath"] = path;
+        data["created"] = localModel->toJSON();
+        store->save(localModel.get());
+        return;
+    }
+
     if (account->usesMicrosoftGraph()) {
         auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
         string displayName = path.substr(path.find_last_of('/') == string::npos ? 0 : path.find_last_of('/') + 1);
@@ -1538,6 +1606,10 @@ void TaskProcessor::performRemoteDestroyCategory(Task * task) {
     json & data = task->data();
     string accountId = task->accountId();
     string path = data["path"].get<string>();
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailClient(account).deleteFolder(path);
+        return;
+    }
     if (account->usesMicrosoftGraph()) {
         auto folder = store->find<Folder>(Query().equal("accountId", accountId).equal("path", path));
         if (!folder || !folder->localStatus().count("graphId")) return;
@@ -1760,6 +1832,24 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
         } else {
             throw SyncException("send-failed", ErrorCodeToTypeMap[err], false);
         }
+    }
+
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailClient client(account);
+        try {
+            string mime((const char *)messageDataForSent->bytes(), messageDataForSent->length());
+            client.importMime(sent->path(), mime);
+        } catch (SyncException & ex) {
+            // SMTP delivery already succeeded. A Sent-folder archival failure must
+            // never turn into a retryable send and deliver the message twice.
+            logger->error("SmarterMail accepted the SMTP send but the Sent copy could not be saved: {}", ex.toJSON().dump());
+        }
+        if (draft.remoteUID() != 0 && draft.remoteUID() <= UINT32_MAX - 5) {
+            try { client.remove(draft.remoteFolder().value("path", ""), {draft.remoteUID()}); }
+            catch (SyncException & ex) { logger->warn("Could not remove the SmarterMail draft after send: {}", ex.toJSON().dump()); }
+        }
+        if (existing) store->remove(existing.get());
+        return;
     }
     
     /* 
@@ -2012,6 +2102,20 @@ void TaskProcessor::performRemoteExpungeAllInFolder(Task * task) {
     const auto path = task->data()["folder"]["path"].get<string>();
     const auto id = task->data()["folder"]["id"].get<string>();
 
+    if (account->usesSmarterMailAPI()) {
+        auto messages = store->findAll<Message>(Query().equal("accountId", task->accountId()).equal("remoteFolderId", id));
+        SmarterMailClient client(account);
+        for (auto block : MailUtils::chunksOfVector(messages, 200)) {
+            vector<uint32_t> uids;
+            for (auto & message : block) if (message->remoteUID() <= UINT32_MAX - 5) uids.push_back(message->remoteUID());
+            if (!uids.empty()) client.remove(path, uids, false);
+            MailStoreTransaction transaction(store, "expungeSmarterMailFolder");
+            for (auto & message : block) store->remove(message.get());
+            transaction.commit();
+        }
+        return;
+    }
+
     if (account->usesMicrosoftGraph()) {
         auto messages = store->findAll<Message>(Query().equal("accountId", task->accountId()).equal("remoteFolderId", id));
         auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
@@ -2066,9 +2170,15 @@ void TaskProcessor::performRemoteGetMessageRFC2822(Task * task) {
         throw SyncException("not-found", "Message not found for RFC2822 fetch", false);
     }
 
-    Data * data = account->usesMicrosoftGraph()
-        ? fetchMicrosoftGraphMIME(account, msg.get())
-        : session->fetchMessageByUID(AS_MCSTR(msg->remoteFolder()["path"].get<string>()), msg->remoteUID(), &cb, &err);
+    Data * data = nullptr;
+    if (account->usesSmarterMailAPI()) {
+        string raw = SmarterMailClient(account).rawMessage(msg->remoteFolder().value("path", ""), msg->remoteUID());
+        data = Data::dataWithBytes(raw.data(), (unsigned int)raw.size());
+    } else if (account->usesMicrosoftGraph()) {
+        data = fetchMicrosoftGraphMIME(account, msg.get());
+    } else {
+        data = session->fetchMessageByUID(AS_MCSTR(msg->remoteFolder()["path"].get<string>()), msg->remoteUID(), &cb, &err);
+    }
     if (err != ErrorNone) {
         logger->error("Unable to fetch rfc2822 for message (UID {}). Error {}", msg->remoteUID(), ErrorCodeToTypeMap[err]);
         throw SyncException(err, "performRemoteGetMessageRFC2822");
@@ -2223,9 +2333,15 @@ void TaskProcessor::performRemoteGetManyRFC2822(Task * task) {
             ErrorCode err = ErrorNone;
 
             try {
-                Data * data = account->usesMicrosoftGraph()
-                    ? fetchMicrosoftGraphMIME(account, msg.get())
-                    : session->fetchMessageByUID(AS_MCSTR(folderPath), msg->remoteUID(), &cb, &err);
+                Data * data = nullptr;
+                if (account->usesSmarterMailAPI()) {
+                    string raw = SmarterMailClient(account).rawMessage(folderPath, msg->remoteUID());
+                    data = Data::dataWithBytes(raw.data(), (unsigned int)raw.size());
+                } else if (account->usesMicrosoftGraph()) {
+                    data = fetchMicrosoftGraphMIME(account, msg.get());
+                } else {
+                    data = session->fetchMessageByUID(AS_MCSTR(folderPath), msg->remoteUID(), &cb, &err);
+                }
 
                 if (err != ErrorNone) {
                     throw SyncException(err, "GetManyRFC2822 fetch");

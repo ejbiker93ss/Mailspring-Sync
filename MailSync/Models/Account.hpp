@@ -43,6 +43,8 @@ public:
     string emailAddress();
     bool usesMicrosoftGraph();
     string graphMailbox();
+    bool usesSmarterMailAPI();
+    string smarterMailServer();
 
     unsigned int IMAPPort();
     string IMAPHost();

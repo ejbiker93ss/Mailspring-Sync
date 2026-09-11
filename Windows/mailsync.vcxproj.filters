@@ -63,6 +63,9 @@
     <ClCompile Include="..\MailSync\SyncWorker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\MailSync\SmarterMailClient.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\MailSync\TaskProcessor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -186,6 +189,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="dbg.h">
+      <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\MailSync\SmarterMailClient.hpp">
       <Filter>Source Files</Filter>
     </ClInclude>
   </ItemGroup>

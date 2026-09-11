@@ -24,6 +24,11 @@ using namespace std;
 
 size_t _onAppendToString(void *contents, size_t length, size_t nmemb, void *userp);
 
+struct HTTPResponse {
+    long status;
+    string body;
+};
+
 // Helper to cleanup curl handle and associated header list stored in CURLOPT_PRIVATE
 void CleanupCurlRequest(CURL * curl_handle);
 
@@ -36,6 +41,7 @@ CURL * CreateCalDavRequest(string url, string method = "GET", const char * paylo
 const json MakeOAuthRefreshRequest(string provider, string clientId, string refreshToken, bool useMicrosoftGraph = false);
 
 const string PerformRequest(CURL * curl_handle);
+const HTTPResponse PerformRequestWithStatus(CURL * curl_handle);
 const json PerformJSONRequest(CURL * curl_handle);
 
 const string PerformExpectedRedirect(string url);

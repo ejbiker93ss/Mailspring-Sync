@@ -187,6 +187,21 @@ const string PerformRequest(CURL * curl_handle) {
     return result;
 }
 
+const HTTPResponse PerformRequestWithStatus(CURL * curl_handle) {
+    string result;
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, _onAppendToString);
+    curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&result);
+    CURLcode res = curl_easy_perform(curl_handle);
+    char * effectiveUrl = nullptr;
+    curl_easy_getinfo(curl_handle, CURLINFO_EFFECTIVE_URL, &effectiveUrl);
+    string url = effectiveUrl ? effectiveUrl : "SmarterMail API";
+    long status = 0;
+    curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &status);
+    CleanupCurlRequest(curl_handle);
+    if (res != CURLE_OK) throw SyncException(res, url);
+    return {status, result};
+}
+
 
 const string PerformExpectedRedirect(string url) {
     CURL * curl_handle = curl_easy_init();

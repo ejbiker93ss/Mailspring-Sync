@@ -47,6 +47,17 @@ string Account::valid() {
 
     json & s = _data["settings"];
 
+    if (usesSmarterMailAPI()) {
+        if (!(s.count("imap_password") && s["imap_password"].is_string() && !s["imap_password"].get<string>().empty())) {
+            return "SmarterMail password";
+        }
+        if (smarterMailServer().empty()) return "SmarterMail server";
+        if (!(s.count("smtp_password") && s.count("smtp_port") && s.count("smtp_host"))) {
+            return "smtp configuration";
+        }
+        return "";
+    }
+
     if (!(s.count("refresh_token") || s.count("imap_password"))) {
         return "imap_password or refresh_token";
     }
@@ -82,6 +93,18 @@ string Account::graphMailbox() {
     json & s = _data["settings"];
     return s.count("graph_mailbox") && s["graph_mailbox"].is_string()
         ? s["graph_mailbox"].get<string>() : "";
+}
+
+bool Account::usesSmarterMailAPI() {
+    json & s = _data["settings"];
+    return provider() == "smartermail" && s.count("smartermail_server") &&
+           s["smartermail_server"].is_string() && !s["smartermail_server"].get<string>().empty();
+}
+
+string Account::smarterMailServer() {
+    json & s = _data["settings"];
+    return s.count("smartermail_server") && s["smartermail_server"].is_string()
+        ? s["smartermail_server"].get<string>() : "";
 }
 
 string Account::emailAddress() {

@@ -43,6 +43,7 @@
 #include "Task.hpp"
 #include "TaskProcessor.hpp"
 #include "NetworkRequestUtils.hpp"
+#include "SmarterMailClient.hpp"
 #include "XOAuth2TokenManager.hpp"
 #include "ThreadUtils.h"
 #include "constants.h"
@@ -287,6 +288,27 @@ int runTestAuth(shared_ptr<Account> account) {
     // Enable very detailed mailcore logging and redirect the messages to our accumulator log
     MCLogEnabled = 1;
     MCLogFn = MCLogToAccumulatorLog;
+
+    if (account->usesSmarterMailAPI()) {
+        json resp = {
+            {"error", nullptr},
+            {"error_service", "smartermail api"},
+            {"log", "----------SMARTERMAIL API----------\n"},
+            {"account", nullptr}
+        };
+        try {
+            SmarterMailClient(account).validate();
+            resp["account"] = account->toJSON();
+            resp["log"] = "SmarterMail API mailbox validation succeeded. No IMAP connection was attempted.\n";
+            cout << resp.dump();
+            return 0;
+        } catch (std::exception & ex) {
+            resp["error"] = "ErrorAuthentication";
+            resp["log"] = string("SmarterMail API mailbox validation failed: ") + ex.what();
+            cout << resp.dump();
+            return 1;
+        }
+    }
 
     if (account->usesMicrosoftGraph()) {
         json resp = {

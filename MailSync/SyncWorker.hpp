@@ -74,6 +74,9 @@ private:
     vector<shared_ptr<Folder>> syncMicrosoftGraphFolders();
     bool syncMicrosoftGraphMessages();
     void syncMicrosoftGraphMessageBody(Message * message);
+    vector<shared_ptr<Folder>> syncSmarterMailFolders();
+    bool syncSmarterMailMessages();
+    void syncSmarterMailMessageBody(Message * message);
     
     void ensureRootSummerMailFolder(vector<string> containerFolderComponents, Array * remoteFolders);
 

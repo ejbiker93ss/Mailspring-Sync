@@ -28,6 +28,7 @@
 #include "NetworkRequestUtils.hpp"
 #include "XOAuth2TokenManager.hpp"
 #include "FolderSyncPolicy.hpp"
+#include "SmarterMailClient.hpp"
 
 
 #define CACHE_CLEANUP_INTERVAL      60 * 60
@@ -138,6 +139,153 @@ static IMAPMessage * graphMessage(const json & remote) {
     return message;
 }
 
+static string smString(const json & value, initializer_list<const char *> keys) {
+    for (const char * key : keys) {
+        if (!value.count(key) || value[key].is_null()) continue;
+        if (value[key].is_string()) return value[key].get<string>();
+        if (value[key].is_number_integer() || value[key].is_number_unsigned()) return value[key].dump();
+    }
+    return "";
+}
+
+static bool smBool(const json & value, initializer_list<const char *> keys) {
+    for (const char * key : keys) {
+        if (!value.count(key) || value[key].is_null()) continue;
+        if (value[key].is_boolean()) return value[key].get<bool>();
+        if (value[key].is_number_integer()) return value[key].get<int>() != 0;
+        if (value[key].is_string()) {
+            string text = value[key].get<string>();
+            transform(text.begin(), text.end(), text.begin(), ::tolower);
+            return text == "true" || text == "1" || text == "yes";
+        }
+    }
+    return false;
+}
+
+static uint32_t smUID(const json & value) {
+    string text = smString(value, {"uid", "UID", "Uid"});
+    if (text.empty()) return 0;
+    try {
+        unsigned long parsed = stoul(text);
+        return parsed > UINT32_MAX ? 0 : (uint32_t)parsed;
+    } catch (...) { return 0; }
+}
+
+static Address * smAddress(const json & value) {
+    string email;
+    string name;
+    if (value.is_object()) {
+        email = smString(value, {"email", "emailAddress", "address"});
+        name = smString(value, {"name", "displayName"});
+    } else if (value.is_string()) {
+        string text = value.get<string>();
+        size_t open = text.rfind('<');
+        size_t close = text.rfind('>');
+        if (open != string::npos && close > open) {
+            name = text.substr(0, open);
+            email = text.substr(open + 1, close - open - 1);
+            while (!name.empty() && isspace((unsigned char)name.back())) name.pop_back();
+            while (!name.empty() && isspace((unsigned char)name.front())) name.erase(name.begin());
+            if (name.size() >= 2 && name.front() == '"' && name.back() == '"') name = name.substr(1, name.size() - 2);
+        } else email = text;
+    }
+    if (email.empty()) return nullptr;
+    return name.empty() ? Address::addressWithMailbox(AS_MCSTR(email))
+                        : Address::addressWithDisplayName(AS_MCSTR(name), AS_MCSTR(email));
+}
+
+static Array * smAddresses(const json & value) {
+    Array * result = new Array();
+    if (value.is_array()) {
+        for (const auto & item : value) {
+            Address * address = smAddress(item);
+            if (address) result->addObject(address);
+        }
+    } else if (value.is_string()) {
+        string text = value.get<string>();
+        string part;
+        stringstream input(text);
+        while (getline(input, part, ',')) {
+            Address * address = smAddress(part);
+            if (address) result->addObject(address);
+        }
+    } else {
+        Address * address = smAddress(value);
+        if (address) result->addObject(address);
+    }
+    return result;
+}
+
+static time_t smDate(const string & value) {
+    if (value.empty()) return time(0);
+    // The first 19 characters of every SmarterMail ISO variant are local date/time.
+    // Apply a trailing numeric offset when present; Z values are already UTC.
+    tm parsed = {};
+    istringstream input(value.substr(0, 19));
+    input >> get_time(&parsed, "%Y-%m-%dT%H:%M:%S");
+    if (input.fail()) return time(0);
+#if defined(_WIN32)
+    time_t result = _mkgmtime(&parsed);
+#else
+    time_t result = timegm(&parsed);
+#endif
+    size_t sign = value.find_last_of("+-");
+    if (sign > 18 && sign + 5 < value.size()) {
+        try {
+            int hours = stoi(value.substr(sign + 1, 2));
+            int minutes = stoi(value.substr(sign + 4, 2));
+            int seconds = hours * 3600 + minutes * 60;
+            result += value[sign] == '+' ? -seconds : seconds;
+        } catch (...) {}
+    }
+    return result;
+}
+
+static IMAPMessage * smMessage(const json & remote, const string & folderPath) {
+    uint32_t uid = smUID(remote);
+    IMAPMessage * message = new IMAPMessage();
+    message->setUid(uid);
+    MessageFlag flags = MessageFlagNone;
+    if (smBool(remote, {"isSeen", "isRead", "read", "seen"})) flags = (MessageFlag)(flags | MessageFlagSeen);
+    if (smBool(remote, {"isDraft", "draft"})) flags = (MessageFlag)(flags | MessageFlagDraft);
+    if (smBool(remote, {"flag", "isFlagged", "flagged"})) flags = (MessageFlag)(flags | MessageFlagFlagged);
+    if (smBool(remote, {"answered", "isAnswered"})) flags = (MessageFlag)(flags | MessageFlagAnswered);
+    message->setFlags(flags);
+
+    MessageHeader * header = message->header();
+    string messageId = smString(remote, {"internetMessageId", "internetMessageID", "rfc822MessageId", "messageID", "messageIdHeader"});
+    if (messageId.empty()) messageId = "smartermail-" + folderPath + "-" + to_string(uid);
+    header->setMessageID(AS_MCSTR(messageId));
+    header->setSubject(AS_MCSTR(smString(remote, {"subject"})));
+    time_t date = smDate(smString(remote, {"internalDate", "date", "dateSent", "dateReceived", "receivedDate"}));
+    header->setDate(date);
+    header->setReceivedDate(date);
+    json from = remote.count("from") ? remote["from"] : json();
+    Address * fromAddress = smAddress(from);
+    if (!fromAddress) {
+        json fallback = {{"email", smString(remote, {"fromEmail", "fromAddress"})}, {"name", smString(remote, {"fromName", "fromDisplayName"})}};
+        fromAddress = smAddress(fallback);
+    }
+    if (fromAddress) header->setFrom(fromAddress);
+    header->setTo(smAddresses(remote.value("to", remote.value("toEmail", json()))));
+    header->setCc(smAddresses(remote.value("cc", json())));
+    header->setBcc(smAddresses(remote.value("bcc", json())));
+    header->setReplyTo(smAddresses(remote.value("replyTo", json())));
+    return message;
+}
+
+static string smFolderRole(string path) {
+    string leaf = path.substr(path.find_last_of('/') == string::npos ? 0 : path.find_last_of('/') + 1);
+    transform(leaf.begin(), leaf.end(), leaf.begin(), ::tolower);
+    if (leaf == "inbox") return "inbox";
+    if (leaf == "sent" || leaf == "sent items" || leaf == "sent mail") return "sent";
+    if (leaf == "drafts" || leaf == "draft") return "drafts";
+    if (leaf == "deleted items" || leaf == "trash") return "trash";
+    if (leaf == "junk email" || leaf == "junk" || leaf == "spam") return "spam";
+    if (leaf == "archive" || leaf == "archives") return "archive";
+    return "";
+}
+
 
 SyncWorker::SyncWorker(shared_ptr<Account> account) :
     store(new MailStore()),
@@ -153,7 +301,7 @@ SyncWorker::SyncWorker(shared_ptr<Account> account) :
 
 void SyncWorker::configure()
 {
-    if (account->usesMicrosoftGraph()) return;
+    if (account->usesMicrosoftGraph() || account->usesSmarterMailAPI()) return;
     // For accounts connecting with XOAuth2, this function may
     // make HTTP requests so it's important this function is called
     // within the thread retry handlers.
@@ -162,7 +310,7 @@ void SyncWorker::configure()
 
 bool SyncWorker::supportsIdle()
 {
-    return account->usesMicrosoftGraph() || session.isIdleEnabled();
+    return account->usesMicrosoftGraph() || account->usesSmarterMailAPI() || session.isIdleEnabled();
 }
 
 void SyncWorker::idleInterrupt()
@@ -185,6 +333,25 @@ void SyncWorker::idleQueueBodiesToSync(vector<string> & ids) {
 
 void SyncWorker::idleCycleIteration()
 {
+    if (account->usesSmarterMailAPI()) {
+        while (true) {
+            string id;
+            {
+                unique_lock<mutex> lock(idleMtx);
+                if (idleFetchBodyIDs.empty()) break;
+                id = idleFetchBodyIDs.back();
+                idleFetchBodyIDs.pop_back();
+            }
+            auto message = store->find<Message>(Query().equal("id", id));
+            if (message) syncSmarterMailMessageBody(message.get());
+        }
+        TaskProcessor taskProcessor { account, store, nullptr };
+        taskProcessor.cleanupOldTasksAtRuntime();
+        auto tasks = store->findAll<Task>(Query().equal("accountId", account->id()).equal("status", "remote"));
+        for (auto & task : tasks) taskProcessor.performRemote(task.get());
+        MailUtils::sleepWorkerUntilWakeOrSec(30);
+        return;
+    }
     if (account->usesMicrosoftGraph()) {
         while (true) {
             string id;
@@ -418,6 +585,7 @@ void SyncWorker::markAllFoldersBusy() {
 bool SyncWorker::syncNow()
 {
     AutoreleasePool pool;
+    if (account->usesSmarterMailAPI()) return syncSmarterMailMessages();
     if (account->usesMicrosoftGraph()) return syncMicrosoftGraphMessages();
     bool syncAgainImmediately = false;
 
@@ -842,10 +1010,113 @@ void SyncWorker::syncMicrosoftGraphMessageBody(Message * message)
     processor->retrievedMessageBody(message, parser);
 }
 
+vector<shared_ptr<Folder>> SyncWorker::syncSmarterMailFolders()
+{
+    logger->info("Syncing SmarterMail API folder list...");
+    SmarterMailClient client(account);
+    vector<json> remoteFolders = client.folders();
+    vector<shared_ptr<Folder>> result;
+    MailStoreTransaction transaction(store, "syncSmarterMailFolders");
+    for (const auto & remote : remoteFolders) {
+        string path = smString(remote, {"path", "name", "folder"});
+        if (path.empty()) continue;
+        string localId = MailUtils::idForFolder(account->id(), "smartermail:" + path);
+        auto local = store->find<Folder>(Query().equal("id", localId));
+        if (!local) local = make_shared<Folder>(localId, account->id(), 0);
+        local->setPath(path);
+        local->setRole(smFolderRole(path));
+        local->localStatus()["smarterMailPath"] = path;
+        local->localStatus()["total"] = remote.value("totalMessages", remote.value("totalCount", 0));
+        local->localStatus()["unread"] = remote.value("unread", remote.value("unreadCount", 0));
+        local->localStatus()[LS_BUSY] = false;
+        store->save(local.get());
+        result.push_back(local);
+    }
+    transaction.commit();
+    return result;
+}
+
+bool SyncWorker::syncSmarterMailMessages()
+{
+    const unsigned int pageSize = 200;
+    const unsigned int maxPages = 100;
+    SmarterMailClient client(account);
+    auto folders = syncSmarterMailFolders();
+    time_t startedAt = time(0);
+
+    for (auto & folder : folders) {
+        string path = folder->path();
+        set<uint32_t> seen;
+        unsigned int skip = 0;
+        unsigned int total = 0;
+        bool hasTotal = false;
+        unsigned int pageNumber = 0;
+        do {
+            SmarterMailPage page = client.messages(path, skip, pageSize);
+            total = page.totalCount;
+            hasTotal = page.hasTotalCount;
+            for (const auto & remote : page.messages) {
+                uint32_t uid = smUID(remote);
+                if (uid == 0) continue;
+                seen.insert(uid);
+                IMAPMessage * value = smMessage(remote, path);
+                auto local = processor->insertFallbackToUpdateMessage(value, *folder, startedAt);
+                local->setSnippet(smString(remote, {"preview", "shortPreview", "previewText", "messagePreview"}).substr(0, 400));
+                local->setSyncedAt(startedAt);
+                store->save(local.get());
+                value->release();
+            }
+            skip += (unsigned int)page.messages.size();
+            pageNumber++;
+            if (page.messages.empty()) break;
+            if (page.messages.size() < pageSize) break;
+        } while ((!hasTotal || skip < total) && pageNumber < maxPages);
+
+        if ((hasTotal && skip < total) || (!hasTotal && pageNumber == maxPages)) {
+            throw SyncException("smartermail-folder-too-large",
+                "SmarterMail folder scan exceeded the safe 20,000-message limit for " + path + ".", true);
+        }
+
+        // Only prune after every page was fetched successfully. This makes external
+        // moves/deletes visible while preventing a transient API error from wiping cache.
+        auto locals = store->findAll<Message>(Query().equal("accountId", account->id()).equal("remoteFolderId", folder->id()));
+        for (auto & local : locals) {
+            if (local->remoteUID() <= UINT32_MAX - 5 && !seen.count(local->remoteUID())) {
+                processor->unlinkMessagesMatchingQuery(Query().equal("id", local->id()), unlinkPhase);
+            }
+        }
+        json before = folder->localStatus();
+        folder->localStatus()["total"] = hasTotal ? total : (unsigned int)seen.size();
+        folder->localStatus()["lastSmarterMailScan"] = startedAt;
+        folder->localStatus()[LS_BUSY] = false;
+        store->saveFolderStatus(folder.get(), before);
+    }
+
+    unlinkPhase = unlinkPhase == 1 ? 2 : 1;
+    processor->deleteMessagesStillUnlinkedFromPhase(unlinkPhase);
+    iterationsSinceLaunch += 1;
+    logger->info("SmarterMail API sync loop complete.");
+    return false;
+}
+
+void SyncWorker::syncSmarterMailMessageBody(Message * message)
+{
+    if (message->remoteUID() == 0 || message->remoteUID() > UINT32_MAX - 5) return;
+    string path = message->remoteFolder().value("path", "");
+    if (path.empty()) return;
+    SmarterMailClient client(account);
+    string raw = client.rawMessage(path, message->remoteUID());
+    Data * data = Data::dataWithBytes(raw.data(), (unsigned int)raw.size());
+    MessageParser * parser = MessageParser::messageParserWithData(data);
+    if (!parser) throw SyncException("invalid-smartermail-message", "SmarterMail returned invalid MIME content.", true);
+    processor->retrievedMessageBody(message, parser);
+}
+
 vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
 {
     // allocated mailcore objects freed when `pool` is removed from the stack
     AutoreleasePool pool;
+    if (account->usesSmarterMailAPI()) return syncSmarterMailFolders();
     if (account->usesMicrosoftGraph()) return syncMicrosoftGraphFolders();
 
     string containerFolderPath = account->containerFolder();
@@ -1482,6 +1753,10 @@ bool SyncWorker::syncMessageBodies(Folder & folder, IMAPFolderStatus & remoteSta
 }
 
 void SyncWorker::syncMessageBody(Message * message) {
+    if (account->usesSmarterMailAPI()) {
+        syncSmarterMailMessageBody(message);
+        return;
+    }
     // allocated mailcore objects freed when `pool` is removed from the stack
     AutoreleasePool pool;
     
