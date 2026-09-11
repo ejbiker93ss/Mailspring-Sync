@@ -24,9 +24,9 @@ DavXML::DavXML(string xml, string url):
     // of Content-Type, and we do the same - we simply attempt to parse whatever the server
     // returns without checking Content-Type first. This pragmatic approach ensures
     // compatibility with non-compliant servers.
-    doc = xmlReadMemory(xml.c_str(), (int)xml.size(), url.c_str(), "utf-8", 0);
+    doc = xmlReadMemory(xml.c_str(), (int)xml.size(), url.c_str(), "utf-8", XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
     if (doc == nullptr) {
-        throw new SyncException("Unable to parse CalDav XML", xml, false);
+        throw SyncException("invalid-dav-xml", "DAV response could not be parsed as XML", true);
     }
 }
 

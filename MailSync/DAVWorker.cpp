@@ -1832,45 +1832,64 @@ void DAVWorker::runForCalendar(string calendarId, string name, string url) {
             payload += "<d:href>" + CalendarSyncPolicy::hrefText(originalHrefs.at(href)) + "</d:href>";
         }
 
-        // Fetch the data (rate limiting is now handled in performXMLRequest)
-        auto icsDoc = performXMLRequest(url, "REPORT", "<c:calendar-multiget xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag /><c:calendar-data /></d:prop>" + payload + "</c:calendar-multiget>");
+        // A single event with XML-invalid description text can make the entire
+        // multiget unreadable. Keep the fast batch path, then GET any resources
+        // it could not supply as raw ICS (without an XML wrapper).
+        shared_ptr<DavXML> icsDoc;
+        try {
+            icsDoc = performXMLRequest(url, "REPORT", "<c:calendar-multiget xmlns:d=\"DAV:\" xmlns:c=\"urn:ietf:params:xml:ns:caldav\"><d:prop><d:getetag /><c:calendar-data /></d:prop>" + payload + "</c:calendar-multiget>");
+        } catch (const SyncException& ex) {
+            if (ex.key != "invalid-dav-xml") throw;
+            logger->warn("Calendar multiget XML was invalid; downloading {} resources individually", chunk.size());
+        }
 
-        // Phase 1: Parse ICS data OUTSIDE the transaction
+        // Parse OUTSIDE the transaction, retaining the calendars that own pointers.
         vector<shared_ptr<ICalendar>> parsedCalendars;
         vector<ParsedCalEvent> parsedEvents;
         set<string> receivedHrefs;
-
-        icsDoc->evaluateXPath("//D:response", ([&](xmlNodePtr node) {
-            auto etag = icsDoc->nodeContentAtXPath(".//D:getetag/text()", node);
-            auto icsData = icsDoc->nodeContentAtXPath(".//caldav:calendar-data/text()", node);
-
-            // Skip empty responses (Google sometimes returns empty data)
-            if (etag == "" || icsData == "") {
-                if (etag != "") {
-                    logger->info("Received calendar event {} with an empty body", etag);
-                }
-                return;
-            }
-
+        auto parseResource = [&](const string& etag, const string& href, const string& icsData) {
+            if (etag.empty() || icsData.empty()) return;
             auto cal = make_shared<ICalendar>(icsData);
             if (cal->Events.empty()) return;
-            parsedCalendars.push_back(cal);
-
-            auto href = icsDoc->nodeContentAtXPath(".//D:href/text()", node);
-            bool complete = true;
-
-            // Process ALL VEVENTs in the ICS file (master + any recurrence exceptions)
-            for (auto icsEvent : cal->Events) {
-                if (icsEvent->DtStart.IsEmpty()) {
-                    complete = false;
-                    continue;
-                }
-                parsedEvents.push_back({etag, href, icsData, icsEvent});
+            // Do not cache an ETag for a partially parsed resource: its missing
+            // exceptions must remain eligible for retry.
+            for (auto event : cal->Events) {
+                if (event->DtStart.IsEmpty()) return;
             }
-            if (complete) receivedHrefs.insert(normalizeHref(href));
-        }));
+            parsedCalendars.push_back(cal);
+            for (auto event : cal->Events) {
+                parsedEvents.push_back({etag, href, icsData, event});
+            }
+            receivedHrefs.insert(normalizeHref(href));
+        };
+
+        if (icsDoc) {
+            icsDoc->evaluateXPath("//D:response", [&](xmlNodePtr node) {
+                parseResource(
+                    icsDoc->nodeContentAtXPath(".//D:getetag/text()", node),
+                    icsDoc->nodeContentAtXPath(".//D:href/text()", node),
+                    icsDoc->nodeContentAtXPath(".//caldav:calendar-data/text()", node));
+            });
+        }
 
         for (const auto& href : chunk) {
+            if (receivedHrefs.count(href)) continue;
+            const auto& original = originalHrefs.at(href);
+            string resourcePath = CalendarSyncPolicy::resourcePath(original);
+            if (resourcePath.empty()) {
+                throw SyncException("invalid-calendar-href", "Calendar resource has no path", true);
+            }
+            // Always retain the authenticated collection's origin, even when
+            // the server inventory supplies an absolute resource URL.
+            string resourceURL = resourcePath.front() == '/'
+                ? replacePath(url, resourcePath)
+                : url + (url.back() == '/' ? "" : "/") + resourcePath;
+            applyRateLimitDelay();
+            // If-Match ties the body to the inventory ETag. A concurrent edit
+            // fails this pass rather than marking a different revision as synced.
+            auto body = performICSRequest(resourceURL, "GET", "", remote.at(href));
+            recordRequestSuccess();
+            parseResource(remote.at(href), original, body);
             if (!receivedHrefs.count(href)) {
                 throw SyncException("incomplete-calendar-fetch", "Calendar download was incomplete; retaining the previous sync checkpoint for retry", true);
             }
