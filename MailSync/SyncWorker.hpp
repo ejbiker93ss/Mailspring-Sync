@@ -48,6 +48,7 @@ public:
 
     SyncWorker(shared_ptr<Account> account);
     void configure();
+    bool supportsIdle();
 
 #pragma mark Foreground Worker
 

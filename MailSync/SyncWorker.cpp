@@ -27,6 +27,7 @@
 #include "SyncException.hpp"
 #include "NetworkRequestUtils.hpp"
 #include "XOAuth2TokenManager.hpp"
+#include "FolderSyncPolicy.hpp"
 
 
 #define CACHE_CLEANUP_INTERVAL      60 * 60
@@ -52,6 +53,7 @@
 #define LS_HIGHESTMODSEQ            "highestmodseq"
 #define LS_UIDVALIDITY              "uidvalidity"
 #define LS_UIDVALIDITY_RESET_COUNT  "uidvalidityResetCount"
+#define LS_MESSAGE_COUNT            "messageCount"
 
 using namespace mailcore;
 using namespace std;
@@ -141,6 +143,7 @@ SyncWorker::SyncWorker(shared_ptr<Account> account) :
     store(new MailStore()),
     account(account),
     unlinkPhase(1),
+    iterationsSinceLaunch(0),
     logger(spdlog::get("logger")),
     processor(new MailProcessor(account, store)),
     session(IMAPSession())
@@ -155,6 +158,11 @@ void SyncWorker::configure()
     // make HTTP requests so it's important this function is called
     // within the thread retry handlers.
     MailUtils::configureSessionForAccount(session, account);
+}
+
+bool SyncWorker::supportsIdle()
+{
+    return account->usesMicrosoftGraph() || session.isIdleEnabled();
 }
 
 void SyncWorker::idleInterrupt()
@@ -334,6 +342,16 @@ void SyncWorker::idleCycleIteration()
         String path = AS_MCSTR(inbox->path());
         IMAPFolderStatus remoteStatus = session.folderStatus(&path, &err);
 
+        if (err != ErrorCode::ErrorNone) {
+            throw SyncException(err, "idleCycleIteration - folderStatus");
+        }
+        if (!FolderSyncPolicy::statusIsUsable(remoteStatus.uidValidity(), remoteStatus.uidNext())) {
+            throw SyncException(
+                "invalid-folder-status",
+                "The IMAP server returned an unusable folder status for " + inbox->path(),
+                true);
+        }
+
         // Note: If we have CONDSTORE but don't have QRESYNC, this if/else may result
         // in us not seeing "vanished" messages until the next shallow sync iteration.
         // Right now I think that's fine.
@@ -439,6 +457,12 @@ bool SyncWorker::syncNow()
             logger->warn("SyncNow: unable to get folder status for {} ({}), skipping...", folder->path(), ErrorCodeToTypeMap[err]);
             continue;
         }
+        if (!FolderSyncPolicy::statusIsUsable(remoteStatus.uidValidity(), remoteStatus.uidNext())) {
+            logger->warn(
+                "SyncNow: IMAP server returned an unusable folder status for {} (uidvalidity={}, uidnext={}), skipping...",
+                folder->path(), remoteStatus.uidValidity(), remoteStatus.uidNext());
+            continue;
+        }
         
         // Step 1: Check folder UIDValidity
         if (localStatus.empty() || localStatus[LS_UIDVALIDITY].is_null()) {
@@ -452,6 +476,7 @@ bool SyncWorker::syncNow()
             localStatus[LS_SYNCED_MIN_UID] = remoteStatus.uidNext();
             localStatus[LS_LAST_SHALLOW] = 0;
             localStatus[LS_LAST_DEEP] = 0;
+            localStatus[LS_MESSAGE_COUNT] = remoteStatus.messageCount();
             firstChunk = true;
         }
         
@@ -466,6 +491,7 @@ bool SyncWorker::syncNow()
             localStatus[LS_BODIES_WANTED] = 0; // pretend we want no message contents
             localStatus[LS_SYNCED_MIN_UID] = 1; // pretend we have scanned all the way to the oldest message
             localStatus[LS_UIDNEXT] = remoteStatus.uidNext();
+            localStatus[LS_MESSAGE_COUNT] = remoteStatus.messageCount();
             store->saveFolderStatus(folder.get(), initialLocalStatus);
             continue;
         }
@@ -502,6 +528,7 @@ bool SyncWorker::syncNow()
             localStatus[LS_SYNCED_MIN_UID] = 1;
             localStatus[LS_LAST_SHALLOW] = time(0);
             localStatus[LS_LAST_DEEP] = time(0);
+            localStatus[LS_MESSAGE_COUNT] = remoteStatus.messageCount();
             
             store->saveFolderStatus(folder.get(), initialLocalStatus);
             continue;
@@ -527,17 +554,28 @@ bool SyncWorker::syncNow()
         
         // Step 3: A) Retrieve new messages  B) update existing messages  C) delete missing messages
         // CONDSTORE, when available, does A + B.
-        // XYZRESYNC, when available, does C
-        if (hasCondstore && hasQResync) {
-            // Hooray! We never need to fetch the entire range to sync. Just look at
-            // highestmodseq / uidnext and sync if we need to.
+        // QRESYNC, when available, does C.
+        bool hasSavedMessageCount = localStatus.count(LS_MESSAGE_COUNT) > 0 &&
+                                    localStatus[LS_MESSAGE_COUNT].is_number_unsigned();
+        uint32_t savedMessageCount = hasSavedMessageCount
+            ? localStatus[LS_MESSAGE_COUNT].get<uint32_t>()
+            : remoteStatus.messageCount();
+        bool folderCountChanged = FolderSyncPolicy::shouldForceShallowScan(
+            hasQResync, hasSavedMessageCount, savedMessageCount, remoteStatus.messageCount());
+
+        if (hasCondstore) {
+            // CONDSTORE handles new messages and flag changes even when QRESYNC is
+            // unavailable. QRESYNC only determines whether removals are included.
             syncFolderChangesViaCondstore(*folder, remoteStatus, true);
-        } else {
+        }
+
+        if (!hasQResync) {
             uint32_t remoteUidnext = remoteStatus.uidNext();
             uint32_t localUidnext = localStatus[LS_UIDNEXT].get<uint32_t>();
-            bool newMessages = remoteUidnext > localUidnext;
+            bool newMessages = !hasCondstore && remoteUidnext > localUidnext;
             bool timeForDeepScan = (iterationsSinceLaunch > 0) && (time(0) - localStatus[LS_LAST_DEEP].get<time_t>() > DEEP_SCAN_INTERVAL);
-            bool timeForShallowScan = !timeForDeepScan && (time(0) - localStatus[LS_LAST_SHALLOW].get<time_t>() > SHALLOW_SCAN_INTERVAL);
+            bool timeForShallowScan = !timeForDeepScan &&
+                (folderCountChanged || time(0) - localStatus[LS_LAST_SHALLOW].get<time_t>() > SHALLOW_SCAN_INTERVAL);
 
             // Okay. If there are new messages in the folder (UIDnext has increased), do a heavy fetch of
             // those /AND/ get the bodies. This ensures people see both very quickly, which is important.
@@ -587,6 +625,8 @@ bool SyncWorker::syncNow()
                 localStatus[LS_UIDNEXT] = remoteUidnext;
             }
         }
+
+        localStatus[LS_MESSAGE_COUNT] = remoteStatus.messageCount();
         
         bool moreToDo = false;
 

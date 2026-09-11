@@ -34,6 +34,7 @@
 #include "MailStore.hpp"
 #include "DeltaStream.hpp"
 #include "SyncWorker.hpp"
+#include "FolderSyncPolicy.hpp"
 #include "MetadataWorker.hpp"
 #include "MetadataExpirationWorker.hpp"
 #include "DAVWorker.hpp"
@@ -222,7 +223,8 @@ void runBackgroundSyncWorker() {
             exceptions::logCurrentExceptionWithStackTrace();
             abort();
         }
-        MailUtils::sleepWorkerUntilWakeOrSec(120);
+        MailUtils::sleepWorkerUntilWakeOrSec(FolderSyncPolicy::backgroundPollIntervalSeconds(
+            bgWorker->account->usesMicrosoftGraph(), bgWorker->supportsIdle()));
     }
 }
 
