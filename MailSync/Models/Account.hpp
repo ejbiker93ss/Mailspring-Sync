@@ -45,6 +45,7 @@ public:
     string graphMailbox();
     bool usesSmarterMailAPI();
     string smarterMailServer();
+    int mailSyncIntervalMinutes();
 
     unsigned int IMAPPort();
     string IMAPHost();

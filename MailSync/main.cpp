@@ -225,7 +225,9 @@ void runBackgroundSyncWorker() {
             abort();
         }
         MailUtils::sleepWorkerUntilWakeOrSec(FolderSyncPolicy::backgroundPollIntervalSeconds(
-            bgWorker->account->usesMicrosoftGraph(), bgWorker->supportsIdle()));
+            bgWorker->account->usesMicrosoftGraph(),
+            bgWorker->supportsIdle(),
+            bgWorker->account->mailSyncIntervalMinutes()));
     }
 }
 

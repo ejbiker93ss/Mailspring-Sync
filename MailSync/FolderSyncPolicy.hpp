@@ -20,10 +20,17 @@ constexpr bool shouldForceShallowScan(
     return !hasQResync && hasSavedMessageCount && savedMessageCount != remoteMessageCount;
 }
 
-constexpr int backgroundPollIntervalSeconds(bool usesMicrosoftGraph, bool supportsIdle) {
+constexpr int backgroundPollIntervalSeconds(
+    bool usesMicrosoftGraph,
+    bool supportsIdle,
+    int configuredMinutes = 0)
+{
     // IDLE accounts have a foreground push loop. Plain IMAP accounts need a
     // shorter fallback poll so changes made by another client do not look stuck.
-    return !usesMicrosoftGraph && !supportsIdle ? 30 : 120;
+    const int automaticSeconds = !usesMicrosoftGraph && !supportsIdle ? 30 : 120;
+    if (configuredMinutes <= 0) return automaticSeconds;
+    if (configuredMinutes > 60) configuredMinutes = 60;
+    return configuredMinutes * 60;
 }
 
 } // namespace FolderSyncPolicy

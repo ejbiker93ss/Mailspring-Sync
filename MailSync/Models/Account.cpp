@@ -107,6 +107,18 @@ string Account::smarterMailServer() {
         ? s["smartermail_server"].get<string>() : "";
 }
 
+int Account::mailSyncIntervalMinutes() {
+    json & s = _data["settings"];
+    if (!s.count("mail_sync_interval_minutes") ||
+        !s["mail_sync_interval_minutes"].is_number_integer()) {
+        return 0;
+    }
+    long long configured = s["mail_sync_interval_minutes"].get<long long>();
+    if (configured < 1) return 0;
+    if (configured > 60) return 60;
+    return static_cast<int>(configured);
+}
+
 string Account::emailAddress() {
     return _data["emailAddress"].get<string>();
 }

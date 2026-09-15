@@ -16,6 +16,10 @@ static_assert(!shouldForceShallowScan(true, true, 10, 9));
 static_assert(backgroundPollIntervalSeconds(false, false) == 30);
 static_assert(backgroundPollIntervalSeconds(false, true) == 120);
 static_assert(backgroundPollIntervalSeconds(true, false) == 120);
+static_assert(backgroundPollIntervalSeconds(false, false, 1) == 60);
+static_assert(backgroundPollIntervalSeconds(false, true, 5) == 300);
+static_assert(backgroundPollIntervalSeconds(true, false, 15) == 900);
+static_assert(backgroundPollIntervalSeconds(true, true, 120) == 3600);
 
 int main() {
     return 0;
