@@ -15,10 +15,10 @@
 typedef unsigned long ulong;
 #endif
 
-// On Linux, use Mailspring's dynamic tidy loader to support different
+// On Linux, use SummerMail's dynamic tidy loader to support different
 // libtidy sonames across distributions. On other platforms, link directly.
 #if defined(__linux__)
-#include "MailspringDynamicTidy.h"
+#include "SummerMailDynamicTidy.h"
 #else
 #include <tidy.h>
 // In tidy-html5 5.8.0+, buffio.h was renamed to tidybuffio.h
@@ -41,10 +41,10 @@ using namespace mailcore;
 String * HTMLCleaner::cleanHTML(String * input)
 {
 #if defined(__linux__)
-    // Linux: use Mailspring's dynamic tidy wrapper
+    // Linux: use SummerMail's dynamic tidy wrapper
     // SECURITY: We must not return unsanitized HTML. If tidy fails, return empty string.
-    if (!mailspring_tidy_available()) {
-        const char* err = mailspring_tidy_error();
+    if (!summermail_tidy_available()) {
+        const char* err = summermail_tidy_error();
         MCLog("HTMLCleaner: libtidy not available - %s", err ? err : "unknown error");
         return String::string();
     }
@@ -53,41 +53,41 @@ String * HTMLCleaner::cleanHTML(String * input)
     MSTidyBuffer errbuf = {0};
     MSTidyBuffer docbuf = {0};
 
-    MSTidyDoc tdoc = mailspring_tidyCreate();
+    MSTidyDoc tdoc = summermail_tidyCreate();
     if (tdoc == NULL) {
         MCLog("HTMLCleaner: tidyCreate failed (out of memory?)");
         return String::string();
     }
 
-    mailspring_tidyBufInit(&output);
-    mailspring_tidyBufInit(&errbuf);
-    mailspring_tidyBufInit(&docbuf);
+    summermail_tidyBufInit(&output);
+    summermail_tidyBufInit(&errbuf);
+    summermail_tidyBufInit(&docbuf);
 
     Data * data = input->dataUsingEncoding("utf-8");
-    mailspring_tidyBufAppend(&docbuf, data->bytes(), data->length());
+    summermail_tidyBufAppend(&docbuf, data->bytes(), data->length());
 
     // Use dynamically resolved option IDs for compatibility across libtidy versions
-    mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_XhtmlOut(), MSTidyYes);
-    mailspring_tidyOptSetInt(tdoc, mailspring_tidyOptId_DoctypeMode(), MSTidyDoctypeUser);
-    mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_Mark(), MSTidyNo);
-    mailspring_tidySetCharEncoding(tdoc, "utf8");
-    mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_ForceOutput(), MSTidyYes);
-    mailspring_tidyOptSetBool(tdoc, mailspring_tidyOptId_ShowWarnings(), MSTidyNo);
-    mailspring_tidyOptSetInt(tdoc, mailspring_tidyOptId_ShowErrors(), 0);
-    mailspring_tidySetErrorBuffer(tdoc, &errbuf);
+    summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_XhtmlOut(), MSTidyYes);
+    summermail_tidyOptSetInt(tdoc, summermail_tidyOptId_DoctypeMode(), MSTidyDoctypeUser);
+    summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_Mark(), MSTidyNo);
+    summermail_tidySetCharEncoding(tdoc, "utf8");
+    summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_ForceOutput(), MSTidyYes);
+    summermail_tidyOptSetBool(tdoc, summermail_tidyOptId_ShowWarnings(), MSTidyNo);
+    summermail_tidyOptSetInt(tdoc, summermail_tidyOptId_ShowErrors(), 0);
+    summermail_tidySetErrorBuffer(tdoc, &errbuf);
 
-    int parseResult = mailspring_tidyParseBuffer(tdoc, &docbuf);
-    int cleanResult = mailspring_tidyCleanAndRepair(tdoc);
-    int saveResult = mailspring_tidySaveBuffer(tdoc, &output);
+    int parseResult = summermail_tidyParseBuffer(tdoc, &docbuf);
+    int cleanResult = summermail_tidyCleanAndRepair(tdoc);
+    int saveResult = summermail_tidySaveBuffer(tdoc, &output);
 
     // Check for severe errors (< 0 means errno-style failure)
     if (parseResult < 0 || cleanResult < 0 || saveResult < 0) {
         MCLog("HTMLCleaner: tidy processing failed (parse=%d, clean=%d, save=%d)",
               parseResult, cleanResult, saveResult);
-        mailspring_tidyBufFree(&docbuf);
-        mailspring_tidyBufFree(&output);
-        mailspring_tidyBufFree(&errbuf);
-        mailspring_tidyRelease(tdoc);
+        summermail_tidyBufFree(&docbuf);
+        summermail_tidyBufFree(&output);
+        summermail_tidyBufFree(&errbuf);
+        summermail_tidyRelease(tdoc);
         return String::string();
     }
 
@@ -96,10 +96,10 @@ String * HTMLCleaner::cleanHTML(String * input)
         result = String::stringWithUTF8Characters((const char *) output.bp);
     }
 
-    mailspring_tidyBufFree(&docbuf);
-    mailspring_tidyBufFree(&output);
-    mailspring_tidyBufFree(&errbuf);
-    mailspring_tidyRelease(tdoc);
+    summermail_tidyBufFree(&docbuf);
+    summermail_tidyBufFree(&output);
+    summermail_tidyBufFree(&errbuf);
+    summermail_tidyRelease(tdoc);
 
     if (result == NULL) {
         MCLog("HTMLCleaner: tidy produced no output");
