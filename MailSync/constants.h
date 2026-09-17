@@ -232,6 +232,13 @@ static vector<string> V10_SETUP_QUERIES = {
     "CREATE INDEX IF NOT EXISTS ThreadAccountSearchDateIndex ON `Thread` (accountId, lastMessageReceivedTimestamp DESC, id)",
 };
 
+// V11: Discard the one-line MIME closing-boundary bodies produced by the
+// SmarterMail raw-content endpoint when its multipart envelope was missing or
+// malformed. The body will be fetched again on the next open.
+static vector<string> V11_SETUP_QUERIES = {
+    "DELETE FROM MessageBody WHERE instr(value, char(10)) = 0 AND lower(trim(value)) LIKE '--%mimepart%--'",
+};
+
 static map<string, string> COMMON_FOLDER_NAMES = {
     {"gel\xc3\xb6scht", "trash"},
     {"papierkorb", "trash"},
