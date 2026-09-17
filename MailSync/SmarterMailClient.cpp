@@ -1,4 +1,5 @@
 #include "SmarterMailClient.hpp"
+#include "SmarterMailRawMessage.hpp"
 
 #include <algorithm>
 #include <map>
@@ -203,11 +204,11 @@ string SmarterMailClient::rawMessage(const string & folder, uint32_t uid) {
                 json envelope = json::parse(raw);
                 for (const char * key : {"messageData", "data", "content", "raw", "rawContent", "message"}) {
                     if (envelope.count(key) && envelope[key].is_string() && !envelope[key].get<string>().empty()) {
-                        return envelope[key].get<string>();
+                        return SmarterMailRawMessage::normalize(envelope[key].get<string>());
                     }
                 }
             } catch (json::exception &) {
-                if (!raw.empty()) return raw;
+                if (!raw.empty()) return SmarterMailRawMessage::normalize(raw);
             }
         } catch (SyncException &) {
             // Endpoint names vary by server version; try the next documented shape.
