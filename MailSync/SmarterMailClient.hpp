@@ -15,6 +15,12 @@ struct SmarterMailPage {
     bool hasTotalCount = false;
 };
 
+struct SmarterMailContactPage {
+    std::vector<nlohmann::json> contacts;
+    unsigned int totalCount = 0;
+    bool hasTotalCount = false;
+};
+
 class SmarterMailClient {
 public:
     explicit SmarterMailClient(std::shared_ptr<Account> account);
@@ -33,6 +39,33 @@ public:
     void renameFolder(const std::string & oldPath, const std::string & newPath);
     void deleteFolder(const std::string & path);
     void importMime(const std::string & folder, const std::string & mime);
+
+    // Calendar and contact calls intentionally mirror the payloads used by
+    // SmarterMail's own web client. Do not replace these with DAV or guessed
+    // endpoint variants; several supported builds return successful empty
+    // responses for payloads that are only slightly different.
+    std::vector<nlohmann::json> calendarSources();
+    std::vector<nlohmann::json> calendarEvents(const std::vector<nlohmann::json> & sources);
+    nlohmann::json calendarEventDetails(const std::string & owner,
+                                        const std::string & calendarId,
+                                        const std::string & eventId);
+    nlohmann::json saveCalendarEvent(const std::string & owner,
+                                     const std::string & calendarId,
+                                     const std::string & eventId,
+                                     const nlohmann::json & event);
+    void deleteCalendarEvent(const std::string & owner,
+                             const std::string & calendarId,
+                             const std::string & eventId);
+
+    std::vector<nlohmann::json> contactSources();
+    SmarterMailContactPage contacts(const std::vector<nlohmann::json> & sources,
+                                    unsigned int skip, unsigned int take,
+                                    const std::string & query = "");
+    nlohmann::json saveContact(const std::string & contactId,
+                               const nlohmann::json & contact);
+    void deleteContact(const std::string & sourceOwner,
+                       const std::string & sourceId,
+                       const std::string & contactId);
 
 private:
     std::shared_ptr<Account> account;

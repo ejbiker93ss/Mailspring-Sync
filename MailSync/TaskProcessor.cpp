@@ -1155,7 +1155,8 @@ void TaskProcessor::performLocalSyncbackContactGroup(Task * task) {
         } else {
             // Create vcf and autogen Contact and ContactGroup
             auto uid = MailUtils::idRandomlyGenerated();
-            auto contact = make_shared<Contact>(uid, account->id(), "", CONTACT_MAX_REFS, CARDDAV_SYNC_SOURCE);
+            auto contact = make_shared<Contact>(uid, account->id(), "", CONTACT_MAX_REFS,
+                account->usesSmarterMailAPI() ? SMARTERMAIL_SYNC_SOURCE : CARDDAV_SYNC_SOURCE);
             contact->setInfo(json::object({{"vcf", "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:"+uid+"\r\nEND:VCARD\r\n"}, {"href", ""}}));
             contact->setHidden(true);
             contact->setName(name);
@@ -1289,7 +1290,8 @@ void TaskProcessor::performRemoteChangeContactGroupMembership(Task * task) {
 
 void TaskProcessor::performLocalSyncbackContact(Task * task) {
     auto clientside = make_shared<Contact>(task->data()["contact"]);
-    auto source = account->provider() == "gmail" ? GOOGLE_SYNC_SOURCE : CARDDAV_SYNC_SOURCE;
+    auto source = account->provider() == "gmail" ? GOOGLE_SYNC_SOURCE :
+        (account->usesSmarterMailAPI() ? SMARTERMAIL_SYNC_SOURCE : CARDDAV_SYNC_SOURCE);
     if (clientside->source() != "" && clientside->source() != source) {
         logger->error("performLocalSyncbackContact: Client picked incorrect source for new contact: {} != {}", source, clientside->source());
         return;
@@ -1302,7 +1304,16 @@ void TaskProcessor::performLocalSyncbackContact(Task * task) {
     // Note: The client may not be aware of all of the key/value pairs we store in contact JSON,
     // so it's JSON in the task may omit some properties. To make sure we don't damage the
     // contact, find and update only the allowed attributes.
-    local->setInfo(clientside->info());
+    if (account->usesSmarterMailAPI()) {
+        json merged = local->info();
+        json clientInfo = clientside->info();
+        for (auto item = clientInfo.begin(); item != clientInfo.end(); ++item) {
+            merged[item.key()] = item.value();
+        }
+        local->setInfo(merged);
+    } else {
+        local->setInfo(clientside->info());
+    }
     local->setName(clientside->name());
     local->setEmail(clientside->email());
     store->save(local.get());

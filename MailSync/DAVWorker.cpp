@@ -10,6 +10,7 @@
 //
 
 #include "DAVWorker.hpp"
+#include "SmarterMailDataWorker.hpp"
 #include "CardDAVDiscoveryPolicy.hpp"
 #include "CalendarSyncPolicy.hpp"
 #include "DAVUtils.hpp"
@@ -422,6 +423,10 @@ DAVWorker::DAVWorker(shared_ptr<Account> account) :
 }
 
 void DAVWorker::run() {
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailDataWorker(account).run();
+        return;
+    }
     try {
         runContacts();
     } catch (SyncException & ex) {
@@ -444,6 +449,10 @@ void DAVWorker::run() {
 }
 
 void DAVWorker::runContacts() {
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailDataWorker(account).runContacts();
+        return;
+    }
     if (account->provider() == "gmail") {
         // Gmail sync uses a separate GoogleContactsWorker
         return;
@@ -870,6 +879,10 @@ string DAVWorker::resolvedCalendarURL(const string & calPath) {
 }
 
 void DAVWorker::writeAndResyncContact(shared_ptr<Contact> contact) {
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailDataWorker(account).writeAndResyncContact(contact);
+        return;
+    }
     shared_ptr<ContactBook> ab = store->find<ContactBook>(Query().equal("accountId", account->id()));
 
     if (ab == nullptr) {
@@ -931,6 +944,10 @@ void DAVWorker::writeAndResyncContact(shared_ptr<Contact> contact) {
 }
 
 void DAVWorker::deleteContact(shared_ptr<Contact> contact) {
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailDataWorker(account).deleteContact(contact);
+        return;
+    }
     if (contact->source() != CARDDAV_SYNC_SOURCE) {
         logger->info("Deleted contact not synced via CardDAV");
         return;
@@ -1454,6 +1471,10 @@ shared_ptr<Contact> DAVWorker::ingestAddressDataNode(shared_ptr<DavXML> doc, xml
 }
 
 void DAVWorker::rebuildContactGroup(shared_ptr<Contact> contact) {
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailDataWorker(account).rebuildContactGroup(contact);
+        return;
+    }
     // Support iCloud's "Contact Groups are just Contacts with a member list field" idea
     // by hiding the contact (so it's still synced via etag) and creating a group for it.
     // Note that we have to tear this down when we unsync the contact.
@@ -1494,6 +1515,10 @@ void DAVWorker::rebuildContactGroup(shared_ptr<Contact> contact) {
 }
 
 void DAVWorker::runCalendars() {
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailDataWorker(account).runCalendars();
+        return;
+    }
     // Gmail uses calHost/calPrincipal set in constructor.
     // All other accounts use dynamic discovery (cached after first run).
     string calendarHomeURL = "";
@@ -2422,6 +2447,10 @@ string DAVWorker::performICSRequest(string _url, string method, string icsData, 
 }
 
 void DAVWorker::writeAndResyncEvent(shared_ptr<Event> event) {
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailDataWorker(account).writeAndResyncEvent(event);
+        return;
+    }
     // 1. Find the calendar to get its URL
     auto calendar = store->find<Calendar>(Query().equal("id", event->calendarId()));
     if (!calendar) {
@@ -2500,6 +2529,10 @@ void DAVWorker::writeAndResyncEvent(shared_ptr<Event> event) {
 }
 
 void DAVWorker::deleteEvent(shared_ptr<Event> event) {
+    if (account->usesSmarterMailAPI()) {
+        SmarterMailDataWorker(account).deleteEvent(event);
+        return;
+    }
     // 1. Find the calendar to get its URL
     auto calendar = store->find<Calendar>(Query().equal("id", event->calendarId()));
     if (!calendar) {

@@ -2,6 +2,7 @@
 #include "SmarterMailRawMessage.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <mutex>
 
@@ -91,6 +92,63 @@ void flattenFolders(const json & input, const string & parent, vector<json> & ou
             if (raw.count(key)) flattenFolders(raw[key], path.empty() ? parent : path, output);
         }
     }
+}
+
+string urlEncode(const string & value) {
+    CURL * curl = curl_easy_init();
+    if (!curl) return value;
+    char * encoded = curl_easy_escape(curl, value.c_str(), (int)value.size());
+    string result = encoded ? encoded : value;
+    if (encoded) curl_free(encoded);
+    curl_easy_cleanup(curl);
+    return result;
+}
+
+string lowerCopy(string value) {
+    transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+        return (char)tolower(c);
+    });
+    return value;
+}
+
+bool isGalSource(const json & source) {
+    if (!source.is_object()) return true;
+    if (source.value("isDomainResource", false)) return true;
+    string id;
+    for (const char * key : {"itemID", "ItemID", "sourceId", "SourceID", "id"}) {
+        if (source.count(key) && source[key].is_string()) {
+            id = source[key].get<string>();
+            if (!id.empty()) break;
+        }
+    }
+    return lowerCopy(id) == "gal";
+}
+
+json normalizedContactSource(json source, const string & emailAddress) {
+    string username = emailAddress;
+    size_t at = username.find('@');
+    if (at != string::npos) username = username.substr(0, at);
+
+    auto firstString = [&](initializer_list<const char *> keys, const string & fallback) {
+        for (const char * key : keys) {
+            if (source.count(key) && source[key].is_string() && !source[key].get<string>().empty()) {
+                return source[key].get<string>();
+            }
+        }
+        return fallback;
+    };
+    string owner = firstString(
+        {"ownerUsername", "OwnerUsername", "ownerEmailAddress", "OwnerEmailAddress", "owner"},
+        username);
+    string name = firstString(
+        {"displayName", "DisplayName", "folder", "Folder", "sourceName"}, "Contacts");
+    string id = firstString(
+        {"itemID", "ItemID", "sourceId", "SourceID", "folder", "Folder", "id"},
+        "Contacts");
+    if (!source.count("owner")) source["owner"] = owner;
+    if (!source.count("id")) source["id"] = id;
+    if (!source.count("sourceName")) source["sourceName"] = name;
+    return source;
 }
 }
 
@@ -271,4 +329,183 @@ void SmarterMailClient::importMime(const string & folder, const string & mime) {
         } catch (SyncException &) {}
     }
     throw SyncException("smartermail-import-mime-failed", "SmarterMail could not save the sent message.", true);
+}
+
+vector<json> SmarterMailClient::calendarSources() {
+    json response = requestJSON("/calendars/sources");
+    bool recognized = false;
+    for (const char * key : {"calendars", "Calendars"}) {
+        if (response.count(key) && response[key].is_array()) {
+            recognized = true;
+            if (!response[key].empty()) return response[key].get<vector<json>>();
+        }
+    }
+    for (const char * key : {"sharedLists", "SharedLists"}) {
+        if (response.count(key) && response[key].is_array()) {
+            recognized = true;
+            if (!response[key].empty()) return response[key].get<vector<json>>();
+        }
+    }
+    if (!recognized) throw SyncException("smartermail-calendar-sources-invalid", "SmarterMail returned an unrecognized calendar source response.", true);
+    return {};
+}
+
+vector<json> SmarterMailClient::calendarEvents(const vector<json> & sources) {
+    json response = requestJSON("/calendars/events-all2", "POST", {
+        {"sources", sources},
+        {"searchParams", {
+            {"skip", 0}, {"take", 0}, {"search", nullptr},
+            {"sortField", nullptr}, {"sortDescending", false}
+        }}
+    });
+    if (response.is_array()) return response.get<vector<json>>();
+    for (const char * key : {"results", "events", "calendarEvents"}) {
+        if (response.count(key) && response[key].is_array()) return response[key].get<vector<json>>();
+    }
+    throw SyncException("smartermail-calendar-events-invalid", "SmarterMail returned an unrecognized calendar event response.", true);
+}
+
+json SmarterMailClient::calendarEventDetails(const string & owner,
+                                              const string & calendarId,
+                                              const string & eventId) {
+    string path = "/calendars/events/" + urlEncode(owner) + "/" +
+                  urlEncode(calendarId) + "/" + urlEncode(eventId);
+    try {
+        json response = requestJSON(path);
+        for (const char * key : {"details", "event", "result"}) {
+            if (response.count(key) && response[key].is_object()) return response[key];
+        }
+        return response.is_object() && !response.empty() ? response : json();
+    } catch (SyncException & ex) {
+        if (ex.key == "smartermail-http-404") return json();
+        throw;
+    }
+}
+
+json SmarterMailClient::saveCalendarEvent(const string & owner,
+                                           const string & calendarId,
+                                           const string & eventId,
+                                           const json & event) {
+    string path = "/calendars/events/save/" + urlEncode(owner) + "/" + urlEncode(calendarId);
+    if (!eventId.empty()) path += "/" + urlEncode(eventId);
+    json response = requestJSON(path, "POST", event);
+    if (response.count("events") && response["events"].is_array() && !response["events"].empty()) {
+        return response["events"][0];
+    }
+    for (const char * key : {"event", "result"}) {
+        if (response.count(key) && response[key].is_object()) return response[key];
+    }
+    return response;
+}
+
+void SmarterMailClient::deleteCalendarEvent(const string & owner,
+                                             const string & calendarId,
+                                             const string & eventId) {
+    const string path = "/calendars/events/delete/" + urlEncode(owner) + "/" +
+                        urlEncode(calendarId) + "/" + urlEncode(eventId) + "/false";
+    json response = requestJSON(path, "POST", {{"instanceStart", nullptr}});
+
+    bool ambiguousEmpty = response.is_array() && response.empty();
+    bool allNullEcho = response.is_array() && !response.empty();
+    if (allNullEcho) {
+        for (const auto & item : response) {
+            if (!item.is_object()) { allNullEcho = false; break; }
+            bool blankOwner = !item.count("owner") || item["owner"].is_null() || item.value("owner", "").empty();
+            bool blankCalendar = !item.count("calendarId") || item["calendarId"].is_null() || item.value("calendarId", "").empty();
+            bool blankEvent = !item.count("eventId") || item["eventId"].is_null() || item.value("eventId", "").empty();
+            if (!(blankOwner && blankCalendar && blankEvent)) { allNullEcho = false; break; }
+        }
+    }
+    if (allNullEcho) {
+        throw SyncException("smartermail-calendar-delete-noop",
+            "SmarterMail accepted the calendar delete request but did not bind its identifiers.", true);
+    }
+    if (ambiguousEmpty && !calendarEventDetails(owner, calendarId, eventId).is_null()) {
+        throw SyncException("smartermail-calendar-delete-noop",
+            "SmarterMail returned an empty delete response and the event still exists.", true);
+    }
+}
+
+vector<json> SmarterMailClient::contactSources() {
+    vector<json> result;
+    try {
+        json response = requestJSON("/contacts/sources");
+        auto append = [&](const json & value) {
+            if (value.is_array()) {
+                for (const auto & raw : value) {
+                    if (raw.is_object() && !isGalSource(raw)) {
+                        result.push_back(normalizedContactSource(raw, account->emailAddress()));
+                    }
+                }
+            } else if (value.is_object() && !isGalSource(value)) {
+                result.push_back(normalizedContactSource(value, account->emailAddress()));
+            }
+        };
+        if (response.count("primaryList")) append(response["primaryList"]);
+        else if (response.count("PrimaryList")) append(response["PrimaryList"]);
+        if (response.count("sharedLists")) append(response["sharedLists"]);
+        else if (response.count("SharedLists")) append(response["SharedLists"]);
+    } catch (SyncException &) {
+        // The user's primary Contacts folder exists even on builds whose
+        // sources endpoint is malformed or unavailable.
+    }
+    if (result.empty()) {
+        string username = account->emailAddress();
+        size_t at = username.find('@');
+        if (at != string::npos) username = username.substr(0, at);
+        result.push_back({
+            {"ownerEmailAddress", account->emailAddress()},
+            {"ownerUsername", account->emailAddress()}, {"folder", "Contacts"},
+            {"owner", username}, {"id", "Contacts"}, {"sourceName", "Contacts"}
+        });
+    }
+    return result;
+}
+
+SmarterMailContactPage SmarterMailClient::contacts(const vector<json> & sources,
+                                                    unsigned int skip,
+                                                    unsigned int take,
+                                                    const string & query) {
+    json response = requestJSON("/contacts/contacts-all", "POST", {
+        {"sources", sources},
+        {"searchParams", {
+            {"categories", nullptr}, {"showNonCategorized", true},
+            {"skip", skip}, {"take", take},
+            {"search", query.empty() ? json(nullptr) : json(query)},
+            {"sortDescending", false}
+        }}
+    });
+    SmarterMailContactPage page;
+    bool recognized = response.is_array();
+    if (response.is_array()) page.contacts = response.get<vector<json>>();
+    else for (const char * key : {"contactList", "results", "contacts"}) {
+        if (response.count(key) && response[key].is_array()) {
+            page.contacts = response[key].get<vector<json>>();
+            recognized = true;
+            break;
+        }
+    }
+    if (!recognized) throw SyncException("smartermail-contacts-invalid", "SmarterMail returned an unrecognized contact list response.", true);
+    for (const char * key : {"totalCount", "TotalCount"}) {
+        if (response.count(key) && response[key].is_number()) {
+            page.totalCount = response[key].get<unsigned int>();
+            page.hasTotalCount = true;
+            break;
+        }
+    }
+    return page;
+}
+
+json SmarterMailClient::saveContact(const string & contactId, const json & contact) {
+    string path = "/contacts/contact-put/" + urlEncode(account->emailAddress());
+    if (!contactId.empty()) path += "/" + urlEncode(contactId);
+    return requestJSON(path, "POST", contact);
+}
+
+void SmarterMailClient::deleteContact(const string & sourceOwner,
+                                      const string & sourceId,
+                                      const string & contactId) {
+    requestJSON("/contacts/delete-bulk", "POST", json::array({{
+        {"sourceOwner", sourceOwner}, {"sourceId", sourceId}, {"id", contactId}
+    }}));
 }

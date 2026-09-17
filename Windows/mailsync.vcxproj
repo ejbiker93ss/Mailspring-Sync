@@ -123,6 +123,7 @@
     <ClCompile Include="..\MailSync\SyncException.cpp" />
     <ClCompile Include="..\MailSync\SyncWorker.cpp" />
     <ClCompile Include="..\MailSync\SmarterMailClient.cpp" />
+    <ClCompile Include="..\MailSync\SmarterMailDataWorker.cpp" />
     <ClCompile Include="..\MailSync\TaskProcessor.cpp" />
     <ClCompile Include="..\MailSync\ThreadUtils.cpp" />
     <ClCompile Include="..\MailSync\XOAuth2TokenManager.cpp" />
@@ -157,6 +158,7 @@
   <ItemGroup>
     <ClInclude Include="dbg.h" />
     <ClInclude Include="..\MailSync\SmarterMailClient.hpp" />
+    <ClInclude Include="..\MailSync\SmarterMailDataWorker.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
