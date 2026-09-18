@@ -21,6 +21,11 @@ struct SmarterMailContactPage {
     bool hasTotalCount = false;
 };
 
+struct SmarterMailMessageBody {
+    std::string mime;
+    bool hasAttachments = false;
+};
+
 class SmarterMailClient {
 public:
     explicit SmarterMailClient(std::shared_ptr<Account> account);
@@ -28,6 +33,7 @@ public:
     void validate();
     std::vector<nlohmann::json> folders();
     SmarterMailPage messages(const std::string & folder, unsigned int skip, unsigned int take);
+    SmarterMailMessageBody messageBody(const std::string & folder, uint32_t uid);
     std::string rawMessage(const std::string & folder, uint32_t uid);
 
     void markRead(const std::string & folder, const std::vector<uint32_t> & uids, bool read);

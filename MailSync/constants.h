@@ -239,6 +239,23 @@ static vector<string> V11_SETUP_QUERIES = {
     "DELETE FROM MessageBody WHERE instr(value, char(10)) = 0 AND lower(trim(value)) LIKE '--%mimepart%--'",
 };
 
+// V12: V11 covered SmarterMail's common `--...mimepart...--` token. Other
+// builds emit an Outlook-style `_006_...--` closing boundary instead.
+static vector<string> V12_SETUP_QUERIES = {
+    "DELETE FROM MessageBody WHERE instr(value, char(10)) = 0 AND length(trim(value)) BETWEEN 12 AND 240 AND substr(trim(value), -2) = '--' AND (substr(trim(value), 1, 1) = '_' OR substr(trim(value), 1, 2) = '--')",
+};
+
+// V13 reruns the boundary-only cleanup after structured message loading was
+// introduced. Early builds could cache the same token from messageHTML before
+// trying SmarterMail's other body fields.
+static vector<string> V13_SETUP_QUERIES = V12_SETUP_QUERIES;
+
+// V14 covers the quoted-printable-looking `=-...==--` closing delimiter
+// returned by SmarterMail for some Exchange-authored messages.
+static vector<string> V14_SETUP_QUERIES = {
+    "DELETE FROM MessageBody WHERE instr(value, char(10)) = 0 AND length(trim(value)) BETWEEN 12 AND 240 AND substr(trim(value), -2) = '--' AND (substr(trim(value), 1, 1) = '_' OR substr(trim(value), 1, 2) = '--' OR substr(trim(value), 1, 2) = '=-')",
+};
+
 static map<string, string> COMMON_FOLDER_NAMES = {
     {"gel\xc3\xb6scht", "trash"},
     {"papierkorb", "trash"},

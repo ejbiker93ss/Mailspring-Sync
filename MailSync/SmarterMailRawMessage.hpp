@@ -57,6 +57,52 @@ inline bool endsWith(const std::string & value, const std::string & suffix) {
            value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
+inline std::string trimmedCopy(const std::string & value) {
+    size_t start = 0;
+    while (start < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[start]))) start++;
+    size_t end = value.size();
+    while (end > start &&
+           std::isspace(static_cast<unsigned char>(value[end - 1]))) end--;
+    return value.substr(start, end - start);
+}
+
+// Some SmarterMail builds occasionally answer a raw-content request with only
+// the final MIME boundary. MailCore accepts that as a plaintext message, which
+// poisons the body cache with text such as `_006_...--`.
+inline bool isClosingBoundaryOnly(const std::string & value) {
+    const std::string candidate = trimmedCopy(value);
+    if (candidate.size() < 12 || candidate.size() > 240 ||
+        !endsWith(candidate, "--") ||
+        candidate.find_first_of("\r\n \t") != std::string::npos) return false;
+    const bool recognizedPrefix = candidate[0] == '_' ||
+                                  candidate.compare(0, 2, "--") == 0 ||
+                                  candidate.compare(0, 2, "=-") == 0;
+    if (!recognizedPrefix) return false;
+    for (char ch : candidate) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (!std::isalnum(c) && ch != '_' && ch != '-' && ch != '=' &&
+            ch != '+' && ch != '.' && ch != '/') return false;
+    }
+    return true;
+}
+
+inline std::string structuredBodyMime(const std::string & html, const std::string & text) {
+    if (!html.empty()) {
+        return "MIME-Version: 1.0\r\n"
+               "Content-Type: text/html; charset=utf-8\r\n"
+               "Content-Transfer-Encoding: 8bit\r\n"
+               "\r\n" + html;
+    }
+    if (!text.empty()) {
+        return "MIME-Version: 1.0\r\n"
+               "Content-Type: text/plain; charset=utf-8\r\n"
+               "Content-Transfer-Encoding: 8bit\r\n"
+               "\r\n" + text;
+    }
+    return {};
+}
+
 inline size_t headerSeparator(const std::string & value, size_t & separatorLength) {
     size_t at = value.find("\r\n\r\n");
     if (at != std::string::npos) {

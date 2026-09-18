@@ -6,6 +6,19 @@
 int main() {
     using SmarterMailRawMessage::normalize;
 
+    assert(SmarterMailRawMessage::isClosingBoundaryOnly(
+        "_006_SA3PR14MB70263191E524297F7A46DFA4C2B8SA3PR14MB7026namp_--"));
+    assert(SmarterMailRawMessage::isClosingBoundaryOnly("--==_mimepart_example--\r\n"));
+    assert(SmarterMailRawMessage::isClosingBoundaryOnly("=-xGT7zo0wYKfbQCXRPNNBFQ==--"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("Thanks --"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly(
+        "<html><body>_005_BYAPR17MB2456namp_--</body></html>"));
+
+    const std::string structured = SmarterMailRawMessage::structuredBodyMime(
+        "<html><body>Fast body</body></html>", "Fast body");
+    assert(structured.find("Content-Type: text/html; charset=utf-8") != std::string::npos);
+    assert(structured.find("Fast body") != std::string::npos);
+
     const std::string html = "<!doctype html><html><body>Hello</body></html>";
     const std::string normalized = normalize(html);
     assert(normalized.find("Content-Type: text/html; charset=utf-8\r\n") != std::string::npos);

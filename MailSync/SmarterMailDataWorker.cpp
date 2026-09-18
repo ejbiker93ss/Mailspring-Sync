@@ -12,6 +12,7 @@
 #include "ContactGroup.hpp"
 #include "DAVUtils.hpp"
 #include "MailStore.hpp"
+#include "MailStoreTransaction.hpp"
 #include "MailUtils.hpp"
 #include "SmarterMailClient.hpp"
 #include "SyncException.hpp"
@@ -406,6 +407,9 @@ void SmarterMailDataWorker::runCalendars() {
     SmarterMailClient client(account);
     vector<json> sources = client.calendarSources();
     vector<json> remoteEvents = client.calendarEvents(sources);
+    // Serialize snapshot application with foreground calendar writes. No network
+    // work belongs in this transaction; a failed snapshot must not prune events.
+    MailStoreTransaction transaction{store, "smartermail:calendars"};
     map<string, shared_ptr<Calendar>> calendars;
     set<string> remoteCalendarIds;
     for (const json & source : sources) {
@@ -446,7 +450,18 @@ void SmarterMailDataWorker::runCalendars() {
         string ics = makeICS(raw, uid);
         ICalendar parsed(ics);
         if (parsed.Events.empty()) continue;
-        auto event = make_shared<Event>(firstString(raw, {"etag", "lastModified", "dateModified"}), account->id(), found->second->id(), ics, parsed.Events.front());
+        auto parsedEvent = parsed.Events.front();
+        string localId = MailUtils::idForEvent(account->id(), found->second->id(), parsedEvent->UID, parsedEvent->RecurrenceId);
+        string etag = firstString(raw, {"etag", "lastModified", "dateModified"});
+        // MailStore chooses INSERT vs UPDATE from the model's persisted version.
+        // Constructing a fresh Event for an existing ID resets that version and
+        // aborts the entire calendar worker with a duplicate-primary-key error.
+        auto event = store->find<Event>(Query().equal("id", localId));
+        if (event) {
+            event->applyICSEventData(etag, uid, ics, parsedEvent);
+        } else {
+            event = make_shared<Event>(etag, account->id(), found->second->id(), ics, parsedEvent);
+        }
         event->setHref(uid);
         event->_data["smOwner"] = owner;
         event->_data["smCalendarId"] = remoteCalendar;
@@ -473,6 +488,9 @@ void SmarterMailDataWorker::runCalendars() {
             store->remove(calendar.get());
         }
     }
+    transaction.commit();
+    auto logger = spdlog::get("logger");
+    if (logger) logger->info("SmarterMail calendar sync complete: {} calendars, {} events", remoteCalendarIds.size(), seenEvents.size());
 }
 
 void SmarterMailDataWorker::writeAndResyncContact(shared_ptr<Contact> contact) {

@@ -253,6 +253,46 @@ SmarterMailPage SmarterMailClient::messages(const string & folder, unsigned int 
     return page;
 }
 
+SmarterMailMessageBody SmarterMailClient::messageBody(const string & folder, uint32_t uid) {
+    json response = requestJSON("/mail/message", "POST", {
+        {"ownerEmailAddress", account->emailAddress()}, {"folder", folder}, {"uid", uid}
+    });
+    json detail = response.count("messageData") ? response["messageData"] : response;
+    SmarterMailMessageBody result;
+
+    if (detail.is_string()) {
+        const string value = detail.get<string>();
+        if (!SmarterMailRawMessage::isClosingBoundaryOnly(value)) {
+            result.mime = SmarterMailRawMessage::normalize(value);
+        }
+        return result;
+    }
+    if (!detail.is_object()) return result;
+
+    auto bodyValue = [&detail](initializer_list<const char *> keys) {
+        for (const char * key : keys) {
+            if (detail.count(key) && detail[key].is_string()) {
+                const string value = detail[key].get<string>();
+                // Some Outlook-generated messages expose a bogus closing MIME
+                // boundary in messageHTML while a later compatibility field
+                // contains the real body. Do not let the first nonempty token
+                // win solely because it appeared under the preferred key.
+                if (!value.empty() && !SmarterMailRawMessage::isClosingBoundaryOnly(value)) {
+                    return value;
+                }
+            }
+        }
+        return string();
+    };
+    const string html = bodyValue({"messageHTML", "messageHtml", "htmlBody", "body"});
+    const string text = bodyValue({"messagePlainText", "textBody", "plainText"});
+    result.mime = SmarterMailRawMessage::structuredBodyMime(html, text);
+    result.hasAttachments =
+        (detail.count("attachments") && detail["attachments"].is_array() && !detail["attachments"].empty()) ||
+        (detail.count("hasAttachments") && detail["hasAttachments"].is_boolean() && detail["hasAttachments"].get<bool>());
+    return result;
+}
+
 string SmarterMailClient::rawMessage(const string & folder, uint32_t uid) {
     json payload = {{"ownerEmailAddress", account->emailAddress()}, {"folder", folder}, {"uid", uid}};
     for (const string & path : {"/mail/message/raw-content", "/mail/message/raw", "/mail/message-raw-content"}) {
@@ -262,11 +302,16 @@ string SmarterMailClient::rawMessage(const string & folder, uint32_t uid) {
                 json envelope = json::parse(raw);
                 for (const char * key : {"messageData", "data", "content", "raw", "rawContent", "message"}) {
                     if (envelope.count(key) && envelope[key].is_string() && !envelope[key].get<string>().empty()) {
-                        return SmarterMailRawMessage::normalize(envelope[key].get<string>());
+                        const string value = envelope[key].get<string>();
+                        if (!SmarterMailRawMessage::isClosingBoundaryOnly(value)) {
+                            return SmarterMailRawMessage::normalize(value);
+                        }
                     }
                 }
             } catch (json::exception &) {
-                if (!raw.empty()) return SmarterMailRawMessage::normalize(raw);
+                if (!raw.empty() && !SmarterMailRawMessage::isClosingBoundaryOnly(raw)) {
+                    return SmarterMailRawMessage::normalize(raw);
+                }
             }
         } catch (SyncException &) {
             // Endpoint names vary by server version; try the next documented shape.

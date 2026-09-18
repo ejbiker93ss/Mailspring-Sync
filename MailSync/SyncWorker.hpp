@@ -71,6 +71,7 @@ public:
 
 private:
 
+    void waitForAPIWork();
     vector<shared_ptr<Folder>> syncMicrosoftGraphFolders();
     bool syncMicrosoftGraphMessages();
     void syncMicrosoftGraphMessageBody(Message * message);

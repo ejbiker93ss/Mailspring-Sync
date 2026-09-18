@@ -9,6 +9,7 @@
 //  in 'LICENSE.md', which is part of the SummerMail-Sync package.
 //
 #include <algorithm>
+#include <chrono>
 #include <functional>
 #include <iomanip>
 #include <set>
@@ -331,9 +332,24 @@ void SyncWorker::idleQueueBodiesToSync(vector<string> & ids) {
     }
 }
 
+void SyncWorker::waitForAPIWork()
+{
+    // idleInterrupt signals idleCv, not MailUtils' background sleep CV.
+    // Keep the predicate and wait under idleMtx so a click arriving just
+    // before we sleep is remembered instead of losing its notification.
+    unique_lock<mutex> lock(idleMtx);
+    idleCv.wait_for(lock, chrono::seconds(30), [this]() {
+        return idleShouldReloop.load() || !idleFetchBodyIDs.empty();
+    });
+    idleShouldReloop = false;
+}
+
 void SyncWorker::idleCycleIteration()
 {
     if (account->usesSmarterMailAPI()) {
+        // Foreground results should reach the renderer immediately; background
+        // folder scans retain their normal 500 ms batching window.
+        store->setStreamDelay(0);
         while (true) {
             string id;
             {
@@ -349,7 +365,7 @@ void SyncWorker::idleCycleIteration()
         taskProcessor.cleanupOldTasksAtRuntime();
         auto tasks = store->findAll<Task>(Query().equal("accountId", account->id()).equal("status", "remote"));
         for (auto & task : tasks) taskProcessor.performRemote(task.get());
-        MailUtils::sleepWorkerUntilWakeOrSec(30);
+        waitForAPIWork();
         return;
     }
     if (account->usesMicrosoftGraph()) {
@@ -368,7 +384,7 @@ void SyncWorker::idleCycleIteration()
         taskProcessor.cleanupOldTasksAtRuntime();
         auto tasks = store->findAll<Task>(Query().equal("accountId", account->id()).equal("status", "remote"));
         for (auto & task : tasks) taskProcessor.performRemote(task.get());
-        MailUtils::sleepWorkerUntilWakeOrSec(30);
+        waitForAPIWork();
         return;
     }
     // Run body requests from the client
@@ -1026,7 +1042,11 @@ vector<shared_ptr<Folder>> SyncWorker::syncSmarterMailFolders()
         local->setPath(path);
         local->setRole(smFolderRole(path));
         local->localStatus()["smarterMailPath"] = path;
-        local->localStatus()["total"] = remote.value("totalMessages", remote.value("totalCount", 0));
+        const unsigned int remoteTotal = remote.value("totalMessages", remote.value("totalCount", 0));
+        local->localStatus()["remoteTotal"] = remoteTotal;
+        if (!local->localStatus().count("lastSmarterMailScan")) {
+            local->localStatus()["total"] = remoteTotal;
+        }
         local->localStatus()["unread"] = remote.value("unread", remote.value("unreadCount", 0));
         local->localStatus()[LS_BUSY] = false;
         store->save(local.get());
@@ -1043,9 +1063,19 @@ bool SyncWorker::syncSmarterMailMessages()
     SmarterMailClient client(account);
     auto folders = syncSmarterMailFolders();
     time_t startedAt = time(0);
+    bool performedFullScan = false;
 
     for (auto & folder : folders) {
         string path = folder->path();
+        const json status = folder->localStatus();
+        const unsigned int previousTotal = status.value("total", 0u);
+        const unsigned int remoteTotal = status.value("remoteTotal", previousTotal);
+        const bool periodicDeepScan = iterationsSinceLaunch > 0 && iterationsSinceLaunch % 30 == 0;
+        const bool fullScan = !status.count("lastSmarterMailScan") ||
+                              remoteTotal < previousTotal ||
+                              remoteTotal > previousTotal + pageSize ||
+                              periodicDeepScan;
+        performedFullScan = performedFullScan || fullScan;
         set<uint32_t> seen;
         unsigned int skip = 0;
         unsigned int total = 0;
@@ -1070,19 +1100,22 @@ bool SyncWorker::syncSmarterMailMessages()
             pageNumber++;
             if (page.messages.empty()) break;
             if (page.messages.size() < pageSize) break;
+            if (!fullScan) break;
         } while ((!hasTotal || skip < total) && pageNumber < maxPages);
 
-        if ((hasTotal && skip < total) || (!hasTotal && pageNumber == maxPages)) {
+        if (fullScan && ((hasTotal && skip < total) || (!hasTotal && pageNumber == maxPages))) {
             throw SyncException("smartermail-folder-too-large",
                 "SmarterMail folder scan exceeded the safe 20,000-message limit for " + path + ".", true);
         }
 
-        // Only prune after every page was fetched successfully. This makes external
-        // moves/deletes visible while preventing a transient API error from wiping cache.
-        auto locals = store->findAll<Message>(Query().equal("accountId", account->id()).equal("remoteFolderId", folder->id()));
-        for (auto & local : locals) {
-            if (local->remoteUID() <= UINT32_MAX - 5 && !seen.count(local->remoteUID())) {
-                processor->unlinkMessagesMatchingQuery(Query().equal("id", local->id()), unlinkPhase);
+        if (fullScan) {
+            // Only prune after every page was fetched successfully. Incremental
+            // passes intentionally touch only the newest page.
+            auto locals = store->findAll<Message>(Query().equal("accountId", account->id()).equal("remoteFolderId", folder->id()));
+            for (auto & local : locals) {
+                if (local->remoteUID() <= UINT32_MAX - 5 && !seen.count(local->remoteUID())) {
+                    processor->unlinkMessagesMatchingQuery(Query().equal("id", local->id()), unlinkPhase);
+                }
             }
         }
         json before = folder->localStatus();
@@ -1092,8 +1125,10 @@ bool SyncWorker::syncSmarterMailMessages()
         store->saveFolderStatus(folder.get(), before);
     }
 
-    unlinkPhase = unlinkPhase == 1 ? 2 : 1;
-    processor->deleteMessagesStillUnlinkedFromPhase(unlinkPhase);
+    if (performedFullScan) {
+        unlinkPhase = unlinkPhase == 1 ? 2 : 1;
+        processor->deleteMessagesStillUnlinkedFromPhase(unlinkPhase);
+    }
     iterationsSinceLaunch += 1;
     logger->info("SmarterMail API sync loop complete.");
     return false;
@@ -1105,11 +1140,22 @@ void SyncWorker::syncSmarterMailMessageBody(Message * message)
     string path = message->remoteFolder().value("path", "");
     if (path.empty()) return;
     SmarterMailClient client(account);
-    string raw = client.rawMessage(path, message->remoteUID());
-    Data * data = Data::dataWithBytes(raw.data(), (unsigned int)raw.size());
+    const auto startedAt = chrono::steady_clock::now();
+    SmarterMailMessageBody body = client.messageBody(path, message->remoteUID());
+    if (body.mime.empty()) {
+        // Raw RFC822 is a compatibility fallback only. Running it beside or
+        // after a valid structured response makes SmarterMail serialize extra
+        // work and has returned a lone closing MIME delimiter on this server.
+        body.mime = client.rawMessage(path, message->remoteUID());
+    }
+    Data * data = Data::dataWithBytes(body.mime.data(), (unsigned int)body.mime.size());
     MessageParser * parser = MessageParser::messageParserWithData(data);
     if (!parser) throw SyncException("invalid-smartermail-message", "SmarterMail returned invalid MIME content.", true);
     processor->retrievedMessageBody(message, parser);
+    const auto elapsed = chrono::duration_cast<chrono::milliseconds>(
+        chrono::steady_clock::now() - startedAt).count();
+    logger->info("Loaded SmarterMail message body for UID {} in {} ms",
+                 message->remoteUID(), elapsed);
 }
 
 vector<shared_ptr<Folder>> SyncWorker::syncFoldersAndLabels()
