@@ -1,4 +1,5 @@
 #include "SmarterMailClient.hpp"
+#include "SmarterMailHeaders.hpp"
 #include "SmarterMailRawMessage.hpp"
 
 #include <algorithm>
@@ -287,6 +288,7 @@ SmarterMailMessageBody SmarterMailClient::messageBody(const string & folder, uin
     const string html = bodyValue({"messageHTML", "messageHtml", "htmlBody", "body"});
     const string text = bodyValue({"messagePlainText", "textBody", "plainText"});
     result.mime = SmarterMailRawMessage::structuredBodyMime(html, text);
+    if (!result.mime.empty()) result.mime = SmarterMailHeaders::mime(detail) + result.mime;
     result.hasAttachments =
         (detail.count("attachments") && detail["attachments"].is_array() && !detail["attachments"].empty()) ||
         (detail.count("hasAttachments") && detail["hasAttachments"].is_boolean() && detail["hasAttachments"].get<bool>());
@@ -313,7 +315,9 @@ string SmarterMailClient::rawMessage(const string & folder, uint32_t uid) {
                     return SmarterMailRawMessage::normalize(raw);
                 }
             }
-        } catch (SyncException &) {
+        } catch (SyncException & ex) {
+            if (ex.key != "smartermail-http-404" && ex.key != "smartermail-http-405" &&
+                ex.key != "smartermail-http-400") throw;
             // Endpoint names vary by server version; try the next documented shape.
         }
     }
@@ -465,9 +469,18 @@ void SmarterMailClient::deleteCalendarEvent(const string & owner,
         throw SyncException("smartermail-calendar-delete-noop",
             "SmarterMail accepted the calendar delete request but did not bind its identifiers.", true);
     }
-    if (ambiguousEmpty && !calendarEventDetails(owner, calendarId, eventId).is_null()) {
-        throw SyncException("smartermail-calendar-delete-noop",
-            "SmarterMail returned an empty delete response and the event still exists.", true);
+    if (ambiguousEmpty) {
+        // This server returns [] on a successful delete, but its detail route
+        // returns 500 for a missing event. Verify absence using a successful full
+        // snapshot instead; never reinterpret a failed detail request as absence.
+        for (const auto & event : calendarEvents(calendarSources())) {
+            string folder = event.value("calId", event.value("calendarId", ""));
+            string uid = event.value("uid", "");
+            if (folder == calendarId && uid == eventId) {
+                throw SyncException("smartermail-calendar-delete-noop",
+                    "SmarterMail returned an empty delete response and the event still exists.", true);
+            }
+        }
     }
 }
 

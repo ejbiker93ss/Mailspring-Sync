@@ -42,6 +42,7 @@ public:
     shared_ptr<Message> insertMessage(IMAPMessage * mMsg, Folder & folder, time_t syncDataTimestamp);
     void updateMessage(Message * local, IMAPMessage * remote, Folder & folder, time_t syncDataTimestamp);
     void retrievedMessageBody(Message * message, MessageParser * parser);
+    void repairSmarterMailThread(Message * message, MessageHeader * header);
     bool retrievedFileData(File * file, Data * data);
     void unlinkMessagesMatchingQuery(Query & query, int phase);
     void deleteMessagesStillUnlinkedFromPhase(int phase);

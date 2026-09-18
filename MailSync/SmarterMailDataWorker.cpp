@@ -251,11 +251,28 @@ string calendarId(const json & raw) {
 }
 
 string eventId(const json & raw) {
-    return firstString(raw, {"id", "eventId", "calendarEventId", "uid"});
+    // Save/delete routes take the UID, not the list row's numeric id.
+    return firstString(raw, {"uid", "eventId", "calendarEventId", "id"});
 }
 
 string eventUid(const json & raw) {
     return firstString(raw, {"uid", "calendarEventUid", "eventUid", "id"});
+}
+
+string calendarOwnerForWrite(SmarterMailClient & client, shared_ptr<Calendar> calendar,
+                             const string & email) {
+    // Keep normalized owners for stable local IDs, but round-trip the server's
+    // owner for API writes. Some servers reject an expanded email with 403.
+    // Resolve against current sources, including for calendars cached by older
+    // versions, rather than guessing a username or retrying another mailbox.
+    for (const auto & source : client.calendarSources()) {
+        const string owner = sourceOwner(source, email);
+        if (calendarId(source) == calendar->_data.value("smCalendarId", "") &&
+            fullOwner(owner, email) == calendar->_data.value("smOwner", "")) {
+            return owner;
+        }
+    }
+    throw SyncException("smartermail-calendar-source-missing", "The calendar is no longer available from SmarterMail.", false);
 }
 
 string makeICS(const json & raw, const string & uid) {
@@ -588,23 +605,29 @@ void SmarterMailDataWorker::writeAndResyncEvent(shared_ptr<Event> event) {
     if (parsed.Events.empty()) throw SyncException("invalid-event", "The event data could not be parsed.", false);
     ICalendarEvent * source = parsed.Events.front();
     string timezone = timezoneFromICS(event->icsData());
-    json body = {{"calendarId", calendar->_data["smCalendarId"]}, {"calendarOwner", calendar->_data["smOwner"]},
+    SmarterMailClient client(account);
+    string apiOwner = calendarOwnerForWrite(client, calendar, account->emailAddress());
+    json body = {{"calendarId", calendar->_data["smCalendarId"]}, {"calendarOwner", apiOwner},
                  {"subject", source->Summary}, {"description", source->Description}, {"location", source->Location},
                  {"allDay", !source->DtStart.WithTime}, {"start", dateEnvelope(source->DtStart, timezone)},
                  {"end", dateEnvelope(source->DtEnd.IsEmpty() ? source->DtStart : source->DtEnd, timezone)}};
     string remoteId = event->_data.value("smEventId", "");
+    if (event->_data.count("smartermail")) remoteId = eventId(event->_data["smartermail"]);
     if (!remoteId.empty()) body["uid"] = remoteId;
     if (!source->RRule.IsEmpty()) body["rrule"] = source->RRule.operator string();
     // Attendees are intentionally omitted: SmarterMail sends duplicate invites
     // when its API receives attendees on ordinary event updates.
-    SmarterMailClient(account).saveCalendarEvent(calendar->_data["smOwner"], calendar->_data["smCalendarId"], remoteId, body);
+    client.saveCalendarEvent(apiOwner, calendar->_data["smCalendarId"], remoteId, body);
     runCalendars();
 }
 
 void SmarterMailDataWorker::deleteEvent(shared_ptr<Event> event) {
     auto calendar = store->find<Calendar>(Query().equal("id", event->calendarId()));
     string remoteId = event->_data.value("smEventId", "");
+    if (event->_data.count("smartermail")) remoteId = eventId(event->_data["smartermail"]);
     if (!calendar || remoteId.empty()) throw SyncException("smartermail-calendar-no-id", "Cannot delete a SmarterMail event without its remote identifiers.", false);
-    SmarterMailClient(account).deleteCalendarEvent(calendar->_data.value("smOwner", account->emailAddress()), calendar->_data.value("smCalendarId", ""), remoteId);
+    SmarterMailClient client(account);
+    string apiOwner = calendarOwnerForWrite(client, calendar, account->emailAddress());
+    client.deleteCalendarEvent(apiOwner, calendar->_data.value("smCalendarId", ""), remoteId);
     store->remove(event.get());
 }
