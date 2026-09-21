@@ -798,7 +798,7 @@ void TaskProcessor::performLocalChangeOnMessages(Task * task, void (*modifyLocal
     data["resolvedMessageIds"] = json::array();
     for (const auto & msg : models.messages) data["resolvedMessageIds"].push_back(msg->id());
     store->save(task);
-    bool recomputeThreadAttributes = data.count("threadIds");
+    bool recomputeThreadAttributes = data.count("threadIds") && !data["threadIds"].empty();
     
     for (auto msg : models.messages) {
         // TEMPORARY
