@@ -793,6 +793,17 @@ void TaskProcessor::performLocalChangeOnMessages(Task * task, void (*modifyLocal
     
     json & data = task->data();
     ChangeMailModels models = inflateMessages(data);
+    const auto threadMessages = models.messages;
+    if (task->constructorName() == "ChangeFolderTask" && data.value("preserveSent", false)) {
+        // Archive is not an explicit move: retain physical Sent copies, regardless
+        // of sender aliases or localized/custom Sent-folder names.
+        set<string> sentFolders;
+        for (const auto & folder : store->findAll<Folder>(Query().equal("accountId", account->id()).equal("role", "sent")))
+            sentFolders.insert(folder->id());
+        models.messages.erase(remove_if(models.messages.begin(), models.messages.end(), [&](const shared_ptr<Message> & msg) {
+            return sentFolders.count(msg->clientFolderId()) || sentFolders.count(msg->remoteFolderId());
+        }), models.messages.end());
+    }
     // Persist exactly the messages whose optimistic changes/locks we own. Thread
     // repairs and incoming replies must not change the remote operation's scope.
     data["resolvedMessageIds"] = json::array();
@@ -835,7 +846,7 @@ void TaskProcessor::performLocalChangeOnMessages(Task * task, void (*modifyLocal
             for (auto pair : threads) {
                 pair.second->resetCountedAttributes();
             }
-            for (auto msg : models.messages) {
+            for (auto msg : threadMessages) {
                 if (threads.count(msg->threadId())) {
                     threads[msg->threadId()]->applyMessageAttributeChanges(MessageEmptySnapshot, msg.get(), allLabels);
                 }

@@ -29,15 +29,21 @@ int main(int argc, char ** argv) {
         return processor.insertMessage(remote, folder, time(0));
     };
     auto a = insert(first, 1), b = insert(second, 2);
+    Folder sent("sent", account->id(), 0);
+    sent.setPath("Custom Sent Folder"); sent.setRole("sent"); store.save(&sent);
+    auto reply = insert(sent, 4);
+    reply->setThreadId(a->threadId()); store.save(reply.get());
     IMAPSession session;
     session.setHostname(MCSTR("127.0.0.1")); session.setPort(atoi(argv[1]));
     session.setUsername(MCSTR("test")); session.setPassword(MCSTR("test"));
     session.setConnectionType(ConnectionTypeClear); session.setAuthType(AuthTypeSASLNone);
     ErrorCode err = ErrorNone; session.connect(&err); assert(err == ErrorNone);
     TaskProcessor tasks(account, &store, &session);
-    Task task("ChangeFolderTask", account->id(), {{"threadIds", {a->threadId(), b->threadId()}}, {"folder", dest.toJSON()}});
+    Task task("ChangeFolderTask", account->id(), {{"threadIds", {a->threadId(), b->threadId()}}, {"folder", dest.toJSON()}, {"preserveSent", true}});
     tasks.performLocal(&task);
     assert(task.data()["resolvedMessageIds"].size() == 2);
+    reply = store.find<Message>(Query().equal("id", reply->id()));
+    assert(reply->clientFolderId() == sent.id() && reply->syncUnsavedChanges() == 0);
     const auto oldThread = a->threadId();
     auto late = insert(first, 3);
     late->setThreadId(oldThread); store.save(late.get());
@@ -58,6 +64,17 @@ int main(int argc, char ** argv) {
     late = store.find<Message>(Query().equal("id", late->id()));
     assert(late->remoteUID() == 3 && late->clientFolderId() == first.id());
     assert(late->syncUnsavedChanges() == 0);
+    reply = store.find<Message>(Query().equal("id", reply->id()));
+    assert(reply->clientFolderId() == sent.id() && reply->remoteFolderId() == sent.id());
+    assert(reply->remoteUID() == 4 && reply->syncUnsavedChanges() == 0);
+    Task onlySent("ChangeFolderTask", account->id(), {{"messageIds", {reply->id()}}, {"folder", dest.toJSON()}, {"preserveSent", true}});
+    tasks.performLocal(&onlySent); tasks.performRemote(&onlySent);
+    assert(onlySent.data()["resolvedMessageIds"].empty());
+    assert(onlySent.toJSON()["error"].is_null());
+    Task explicitMove("ChangeFolderTask", account->id(), {{"messageIds", {reply->id()}}, {"folder", dest.toJSON()}});
+    tasks.performLocal(&explicitMove);
+    reply = store.find<Message>(Query().equal("id", reply->id()));
+    assert(reply->clientFolderId() == dest.id()); // Move-to-folder remains explicit.
     if (std::string(argv[2]) == "partial") {
         assert(a->remoteUID() == 101 && a->remoteFolderId() == dest.id());
         assert(a->clientFolderId() == dest.id());
@@ -83,5 +100,6 @@ int main(int argc, char ** argv) {
     assert(MoveResult::newlyObserved(rows, {}, "test@example.invalid") == 101);
     assert(MoveResult::newlyObserved(rows, {101}, "test@example.invalid") == 0);
     assert(MoveResult::newlyObserved(rows, {}, "different@example.invalid") == 0);
+    std::cout << "PASS: archive preserves Sent copies; Sent-only archive is a no-op; explicit moves remain supported\n";
     std::cout << "PASS: thread snapshot survives repair; late replies stay; confirmed progress survives; failures and unresolved API IDs restore; safe UID mapping\n";
 }
