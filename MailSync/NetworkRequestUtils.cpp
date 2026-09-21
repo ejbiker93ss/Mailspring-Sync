@@ -73,7 +73,9 @@ const json MakeOAuthRefreshRequest(string provider, string clientId, string refr
     curl_free(r);
 
     if (useMicrosoftGraph) {
-        payload += "&scope=https%3A%2F%2Fgraph.microsoft.com%2FMail.ReadWrite%20https%3A%2F%2Fgraph.microsoft.com%2FMail.ReadWrite.Shared%20https%3A%2F%2Fgraph.microsoft.com%2FMail.Send%20https%3A%2F%2Fgraph.microsoft.com%2FMail.Send.Shared%20https%3A%2F%2Fgraph.microsoft.com%2FUser.Read%20offline_access";
+        // Omitting scope preserves the originally consented Graph scopes, including
+        // To Do for newly authorized accounts, without requiring old accounts to
+        // grant new permissions just to keep synchronizing mail.
     } else if (provider == "office365" || provider == "outlook") {
         // workaround the fact that Microsoft's OAUTH flow allows you to authorize many scopes, but you
         // have to get a separate token for outlook (email + IMAP) and contacts / calendar / Microsoft Graph APIs

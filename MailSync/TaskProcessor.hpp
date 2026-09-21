@@ -52,6 +52,7 @@ public:
     
 private:
     ChangeMailModels inflateMessages(json & data);
+    void settleMessageChanges(const vector<shared_ptr<Message>> & messages, bool updatesFolder, bool failed);
     ChangeMailModels inflateThreadsAndMessages(json & data);
     Message inflateClientDraftJSON(json & draftJSON, shared_ptr<Message> existing);
 

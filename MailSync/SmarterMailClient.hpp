@@ -24,6 +24,9 @@ struct SmarterMailContactPage {
 struct SmarterMailMessageBody {
     std::string mime;
     bool hasAttachments = false;
+    uint32_t replyUid = 0;
+    std::string replyFolder;
+    std::string replyOwner;
 };
 
 class SmarterMailClient {
@@ -31,10 +34,14 @@ public:
     explicit SmarterMailClient(std::shared_ptr<Account> account);
 
     void validate();
+    nlohmann::json taskOperation(const nlohmann::json & request);
     std::vector<nlohmann::json> folders();
     SmarterMailPage messages(const std::string & folder, unsigned int skip, unsigned int take);
     SmarterMailMessageBody messageBody(const std::string & folder, uint32_t uid);
     std::string rawMessage(const std::string & folder, uint32_t uid);
+    void sendMessage(const nlohmann::json & payload);
+    void uploadComposeAttachment(const std::string & guid, const std::string & filename,
+                                 const std::string & contentType, const std::string & bytes);
 
     void markRead(const std::string & folder, const std::vector<uint32_t> & uids, bool read);
     void setFlagged(const std::string & folder, const std::vector<uint32_t> & uids, bool flagged);
@@ -76,6 +83,7 @@ public:
 private:
     std::shared_ptr<Account> account;
     std::string baseUrl;
+    long requestTimeout = 0;
 
     void authenticate(bool force = false);
     nlohmann::json requestJSON(const std::string & path, const std::string & method = "GET",

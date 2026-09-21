@@ -44,6 +44,7 @@
 #include "TaskProcessor.hpp"
 #include "NetworkRequestUtils.hpp"
 #include "SmarterMailClient.hpp"
+#include "ProviderTasks.hpp"
 #include "XOAuth2TokenManager.hpp"
 #include "ThreadUtils.h"
 #include "constants.h"
@@ -715,6 +716,29 @@ void runListenOnMainThread(shared_ptr<Account> account) {
 
         try {
             string type = packet.count("type") ? packet["type"].get<string>() : "";
+
+            if (type == "provider-tasks") {
+                static atomic<bool> taskRequestRunning { false };
+                const string requestId = packet.at("requestId");
+                auto reply = [requestId](json data) {
+                    data["id"] = requestId;
+                    SharedDeltaStream()->emit(DeltaStreamItem("persist", "ProviderTaskResponse", {data}), 0);
+                };
+                bool expected = false;
+                if (!taskRequestRunning.compare_exchange_strong(expected, true)) {
+                    reply({{"error", "A task request is already running. Try again shortly."}});
+                } else {
+                    std::thread([account, packet, reply]() {
+                        SetThreadName("providerTasks");
+                        AutoreleasePool pool;
+                        try { reply({{"result", providerTaskOperation(account, packet)}}); }
+                        catch (const SyncException & ex) { reply({{"error", ex.debuginfo.empty() ? ex.key : ex.debuginfo}}); }
+                        catch (...) { reply({{"error", "Task request failed. Refresh before retrying a change."}}); }
+                        taskRequestRunning = false;
+                    }).detach();
+                }
+                continue;
+            }
 
             if (type == "queue-task") {
                 packet["task"]["v"] = 0;

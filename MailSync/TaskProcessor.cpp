@@ -29,6 +29,9 @@
 #include "NetworkRequestUtils.hpp"
 #include "XOAuth2TokenManager.hpp"
 #include "SmarterMailClient.hpp"
+#include "ReplyHeaders.hpp"
+#include "SmarterMailCompose.hpp"
+#include "MoveResult.hpp"
 
 #include <sstream>
 #include <algorithm>
@@ -111,21 +114,39 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
             throw SyncException(err, "moveMessages(copy)");
         }
         session->storeFlagsByUID(path, uids, IMAPStoreFlagsRequestKindAdd, MessageFlagDeleted, &err);
-        session->expunge(path, &err); // this will empty their whole trash...
+        if (err != ErrorNone) throw SyncException(err, "moveMessages(mark deleted after copy)");
+        if (session->storedCapabilities()->containsIndex(IMAPCapabilityUIDPlus)) {
+            session->expungeUIDs(path, uids, &err);
+        } else {
+            session->expunge(path, &err);
+        }
         if (err != ErrorCode::ErrorNone) {
             throw SyncException(err, "moveMessages(copy cleanup)");
         }
         mustApplyAttributes = true;
     }
 
+    // An OK response alone is not proof that every requested UID moved. Only
+    // fetch flags for this batch, never scan the source mailbox or fetch bodies.
+    Array * remaining = session->fetchMessagesByUID(path, IMAPMessagesRequestKindFlags, uids, nullptr, &err);
+    if (err != ErrorNone) throw SyncException(err, "moveMessages(verify source)");
+    if (!remaining) throw SyncException("move-unconfirmed", "Source verification unavailable", false);
+    set<uint32_t> remainingUIDs;
+    for (unsigned int i = 0; i < remaining->count(); ++i) {
+        remainingUIDs.insert(((IMAPMessage *)remaining->objectAtIndex(i))->uid());
+    }
+    bool missingMapping = false;
+
     // Only returned if UIDPLUS extension is present and the server tells us
     // which UIDs in the old folder map to which UIDs in the new folder.
     if (uidmap != nullptr) {
         for (auto msg : messages) {
+            if (remainingUIDs.count(msg->remoteUID())) continue;
             Value * currentUID = Value::valueWithUnsignedLongValue(msg->remoteUID());
             Value * newUID = (Value *)uidmap->objectForKey(currentUID);
             if (!newUID) {
-                throw SyncException("generic", "move did not provide new UID.", false);
+                missingMapping = true;
+                continue;
             }
             msg->setRemoteFolder(destFolder);
             msg->setRemoteUID(newUID->unsignedIntValue());
@@ -134,6 +155,8 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
         // UIDPLUS is not supported, we need to manually find the messages. Thankfully moves
         // should add higher UIDs to the folder so we can grab the last few and get the messages
         auto status = session->folderStatus(destPath, &err);
+        if (err != ErrorNone) throw SyncException(err, "moveMessages(destination status)");
+        if (!status) throw SyncException("move-unconfirmed", "Destination status unavailable", false);
         IMAPMessagesRequestKind kind = MailUtils::messagesRequestKindFor(session->storedCapabilities(), true);
         
         if (status != nullptr) {
@@ -143,14 +166,18 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
             uint32_t uidNext = status->uidNext();
             uint32_t searchRange = (uint32_t)messages.size() * 2;
             uint32_t min = (uidNext > searchRange) ? (uidNext - searchRange) : 1;
-            IndexSet * set = IndexSet::indexSetWithRange(RangeMake(min, UINT64_MAX));
+            if (uidNext <= min) throw SyncException("move-unconfirmed", "Destination UID window unavailable", false);
+            IndexSet * set = IndexSet::indexSetWithRange(RangeMake(min, uidNext - min));
             Array * movedMessages = session->fetchMessagesByUID(destPath, kind, set, nullptr, &err);
+            if (err != ErrorNone) throw SyncException(err, "moveMessages(destination lookup)");
+            if (!movedMessages) throw SyncException("move-unconfirmed", "Destination lookup unavailable", false);
             for (auto msg : messages) {
+                if (remainingUIDs.count(msg->remoteUID())) continue;
                 bool found = false;
                 for (unsigned int ii = 0; ii < movedMessages->count(); ii ++) {
                     IMAPMessage * movedMessage = (IMAPMessage*)movedMessages->objectAtIndex(ii);
                     string movedId = MailUtils::idForMessage(msg->accountId(), destFolder->path(), movedMessage);
-                    if (msg->id() == movedId) {
+                    if (msg->id() == movedId || msg->_data.value("physicalBaseId", string()) == movedId) {
                         msg->setRemoteFolder(destFolder);
                         msg->setRemoteUID(movedMessage->uid());
                         found = true;
@@ -158,12 +185,15 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
                     }
                 }
                 if (!found) {
-                    spdlog::get("logger")->error("-- Could not find new UID for message {}", msg->id());
+                    missingMapping = true;
                 }
             }
         }
     }
     
+    if (!remainingUIDs.empty() || missingMapping) {
+        throw SyncException("move-incomplete", "Some messages could not be confirmed in the destination. Check both folders before retrying.", false);
+    }
     if (mustApplyAttributes) {
         for (auto msg : messages) {
             if (msg->remoteFolderId() == destFolder->id()) {
@@ -177,6 +207,7 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
         
                 if (flags != MessageFlagNone) {
                     session->storeFlagsByUID(destPath, IndexSet::indexSetWithIndex(msg->remoteUID()), IMAPStoreFlagsRequestKindSet, flags, &err);
+                    if (err != ErrorNone) throw SyncException(err, "moveMessages(destination flags)");
                 }
             }
         }
@@ -193,7 +224,7 @@ void _removeMessagesResilient(IMAPSession * session, MailStore * store, string a
     session->storeFlagsByUID(path, uids, IMAPStoreFlagsRequestKindAdd, MessageFlagDeleted, &err);
     if (err != ErrorNone) {
         spdlog::get("logger")->info("X- removeMessages could not add deleted flag (error: {})", ErrorCodeToTypeMap[err]);
-        return;
+        throw SyncException(err, "removeMessages(mark deleted)");
     }
     
     // If possible, move the messages to the identified trash folder.
@@ -227,7 +258,7 @@ void _removeMessagesResilient(IMAPSession * session, MailStore * store, string a
                 session->storeFlagsByUID(path, uids, IMAPStoreFlagsRequestKindAdd, MessageFlagDeleted, &err);
                 if (err != ErrorNone) {
                     spdlog::get("logger")->info("X- removeMessages could not add deleted flag (error: {})", ErrorCodeToTypeMap[err]);
-                    err = ErrorNone;
+                    throw SyncException(err, "removeMessages(mark deleted in trash)");
                 }
             }
         }
@@ -249,6 +280,14 @@ void _removeMessagesResilient(IMAPSession * session, MailStore * store, string a
 
     if (err != ErrorNone) {
         spdlog::get("logger")->info("X- removeMessages Expunge failed (error: {})", ErrorCodeToTypeMap[err]);
+        throw SyncException(err, "removeMessages(expunge)");
+    }
+    if (uids->count() > 0) {
+        Array * remaining = session->fetchMessagesByUID(path, IMAPMessagesRequestKindFlags, uids, nullptr, &err);
+        if (err != ErrorNone) throw SyncException(err, "removeMessages(verify)");
+        if (!remaining || remaining->count() > 0) {
+            throw SyncException("delete-unconfirmed", "The server did not confirm removal of every requested message.", false);
+        }
     }
 }
 
@@ -725,7 +764,10 @@ Message TaskProcessor::inflateClientDraftJSON(json & draftJSON, shared_ptr<Messa
 ChangeMailModels TaskProcessor::inflateMessages(json & data) {
     ChangeMailModels models;
 
-    if (data.count("threadIds")) {
+    if (data.count("resolvedMessageIds")) {
+        auto ids = data["resolvedMessageIds"].get<vector<string>>();
+        models.messages = store->findLargeSet<Message>("id", ids);
+    } else if (data.count("threadIds") && !data["threadIds"].empty()) {
         vector<string> threadIds{};
         for (auto & member : data["threadIds"]) {
             threadIds.push_back(member.get<string>());
@@ -740,6 +782,9 @@ ChangeMailModels TaskProcessor::inflateMessages(json & data) {
         models.messages = store->findLargeSet<Message>("id", messageIds);
     }
     
+    models.messages.erase(remove_if(models.messages.begin(), models.messages.end(), [&](const shared_ptr<Message> & msg) {
+        return msg->accountId() != account->id();
+    }), models.messages.end());
     return models;
 }
 
@@ -748,6 +793,11 @@ void TaskProcessor::performLocalChangeOnMessages(Task * task, void (*modifyLocal
     
     json & data = task->data();
     ChangeMailModels models = inflateMessages(data);
+    // Persist exactly the messages whose optimistic changes/locks we own. Thread
+    // repairs and incoming replies must not change the remote operation's scope.
+    data["resolvedMessageIds"] = json::array();
+    for (const auto & msg : models.messages) data["resolvedMessageIds"].push_back(msg->id());
+    store->save(task);
     bool recomputeThreadAttributes = data.count("threadIds");
     
     for (auto msg : models.messages) {
@@ -800,6 +850,31 @@ void TaskProcessor::performLocalChangeOnMessages(Task * task, void (*modifyLocal
     transaction.commit();
 }
 
+void TaskProcessor::settleMessageChanges(const vector<shared_ptr<Message>> & messages, bool updatesFolder, bool failed) {
+    MailStoreTransaction transaction{store, "settleMessageChanges"};
+    for (const auto & unsafe : messages) {
+        auto safe = store->find<Message>(Query().equal("id", unsafe->id()).equal("accountId", account->id()));
+        if (!safe) continue;
+        if (updatesFolder) {
+            safe->setRemoteUID(unsafe->remoteUID());
+            safe->setRemoteFolder(unsafe->remoteFolder());
+            safe->setGraphId(unsafe->graphId());
+        }
+        int remaining = max(0, safe->syncUnsavedChanges() - 1);
+        safe->setSyncUnsavedChanges(remaining);
+        if (remaining == 0) {
+            safe->setSyncedAt(failed ? 0 : time(0));
+            if (updatesFolder) {
+                Folder actual{safe->remoteFolder()};
+                safe->setClientFolder(&actual);
+            }
+        }
+        store->save(safe.get());
+    }
+    // Publish corrected folder/counter state, including partially completed moves.
+    transaction.commit();
+}
+
 void TaskProcessor::performRemoteChangeOnMessages(Task * task, bool updatesFolder, void (*applyInFolder)(IMAPSession * session, String * path, IndexSet * uids, vector<shared_ptr<Message>> messages, json & data)) {
     // Perform the remote action on the impacted messages
     json & data = task->data();
@@ -809,63 +884,37 @@ void TaskProcessor::performRemoteChangeOnMessages(Task * task, bool updatesFolde
     // this code does I/O and is not inside a transaction! Other task
     // performLocal calls could be happening at the same time.
     vector<shared_ptr<Message>> messages = inflateMessages(data).messages;
-    map<string, shared_ptr<IndexSet>> uidsByFolder{};
     map<string, vector<shared_ptr<Message>>> msgsByFolder{};
-    map<string, shared_ptr<Message>> messagesById{};
 
     for (auto msg : messages) {
         string path = msg->remoteFolder()["path"].get<string>();
-        uint32_t uid = msg->remoteUID();
-        if (!uidsByFolder.count(path)) {
-            uidsByFolder[path] = make_shared<IndexSet>();
-            msgsByFolder[path] = {};
-        }
-        uidsByFolder[path]->addIndex(uid);
         msgsByFolder[path].push_back(msg);
-        messagesById[msg->id()] = msg;
     }
     
-    for (auto pair : msgsByFolder) {
-        auto & msgs = pair.second;
-        IndexSet * uids = uidsByFolder[pair.first].get();
-        
-        // perform the action. NOTE! This function is allowed to mutate the messages,
-        // for example to set their remoteUID after a move.
-        applyInFolder(session, AS_MCSTR(pair.first), uids, msgs, data);
-    }
-    
-    // Reload the messages inside a transaction, save any changes made to "remote" attributes
-    // by applyInFolder and decrement locks.
-    {
-        MailStoreTransaction transaction{store, "performRemoteChangeOnMessages"};
-        vector<shared_ptr<Message>> safeMessages = inflateMessages(data).messages;
-        
-        for (auto safe : safeMessages) {
-            if (!messagesById.count(safe->id())) {
-                logger->info("-- Could not find msg {} to apply remote changes", safe->id());
-                continue;
+    set<string> completed;
+    auto persistBatch = [&](const vector<shared_ptr<Message>> & batch, bool failed) {
+        settleMessageChanges(batch, updatesFolder, failed);
+    };
+    try {
+        for (auto & pair : msgsByFolder) {
+            // Bound command length, verification work and recovery to 100 UIDs.
+            for (auto batch : MailUtils::chunksOfVector(pair.second, 100)) {
+                IndexSet * uids = IndexSet::indexSet();
+                for (auto msg : batch) uids->addIndex(msg->remoteUID());
+                if (!updatesFolder || pair.first != data["folder"]["path"].get<string>()) {
+                    applyInFolder(session, AS_MCSTR(pair.first), uids, batch, data);
+                }
+                persistBatch(batch, false);
+                for (auto msg : batch) completed.insert(msg->id());
             }
-            auto unsafe = messagesById[safe->id()];
-
-            // NOTE: We only want to apply the attributes the `applyInFolder` method modifies
-            // to avoid overwriting other changes that may have happened. For example, running
-            // performRemote on a ChangeUnreadTask shouldn't set setRemoteFolder.
-            if (updatesFolder) {
-                safe->setRemoteUID(unsafe->remoteUID());
-                safe->setRemoteFolder(unsafe->remoteFolder());
-            }
-            int suc = safe->syncUnsavedChanges() - 1;
-            safe->setSyncUnsavedChanges(suc);
-            if (suc == 0) {
-                safe->setSyncedAt(time(0));
-            }
-            store->save(safe.get());
         }
-        // We know we do not need to `emit` this change, because it's all internal fields and
-        // remote values, not things reflected in the client. This is good for perf because
-        // the client does silly things like refresh MessageItems when new versions arrive.
-        store->unsafeEraseTransactionDeltas();
-        transaction.commit();
+    } catch (const SyncException &) {
+        // Preserve confirmed mappings even if a later batch failed. Release only
+        // this task's optimistic locks; a newer queued action still owns its lock.
+        vector<shared_ptr<Message>> pending;
+        for (auto msg : messages) if (!completed.count(msg->id())) pending.push_back(msg);
+        persistBatch(pending, true);
+        throw;
     }
 }
 
@@ -873,8 +922,10 @@ void TaskProcessor::performRemoteMicrosoftGraphChange(Task * task) {
     json & data = task->data();
     string cname = task->constructorName();
     auto messages = inflateMessages(data).messages;
-    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
     shared_ptr<Folder> destination = nullptr;
+    set<string> completed;
+    try {
+    auto token = SharedXOAuth2TokenManager()->partsForAccount(account).accessToken;
     if (cname == "ChangeFolderTask") {
         destination = store->find<Folder>(Query().equal("id", data["folder"]["id"].get<string>()));
         if (!destination || !destination->localStatus().count("graphId")) {
@@ -882,9 +933,14 @@ void TaskProcessor::performRemoteMicrosoftGraphChange(Task * task) {
         }
     }
 
-    map<string, string> movedGraphIds;
     for (auto & message : messages) {
-        if (message->graphId().empty()) continue;
+        if (destination && message->remoteFolderId() == destination->id()) {
+            settleMessageChanges({message}, true, false);
+            completed.insert(message->id());
+            continue;
+        }
+        if (message->graphId().empty())
+            throw SyncException("move-unresolved", "A message has no server identity. Synchronize and retry.", false);
         string url = MicrosoftGraphBaseURL(account) + "/messages/" + taskGraphUrlEncode(message->graphId());
         json payload;
         string method = "PATCH";
@@ -899,23 +955,22 @@ void TaskProcessor::performRemoteMicrosoftGraphChange(Task * task) {
         }
         string serialized = payload.dump();
         json response = PerformJSONRequest(CreateMicrosoftGraphRequest(url, method, token, serialized.c_str()));
-        if (cname == "ChangeFolderTask" && response.count("id")) {
-            movedGraphIds[message->id()] = response["id"].get<string>();
+        if (destination) {
+            if (!response.count("id") || !response["id"].is_string() || response["id"].get<string>().empty() ||
+                response.value("parentFolderId", string()) != destination->localStatus()["graphId"].get<string>())
+                throw SyncException("move-unconfirmed", "The server did not confirm the moved message. Refresh both folders before retrying.", false);
+            message->setGraphId(response["id"].get<string>());
+            message->setRemoteFolder(destination.get());
         }
+        settleMessageChanges({message}, destination != nullptr, false);
+        completed.insert(message->id());
     }
-
-    MailStoreTransaction transaction{store, "performRemoteMicrosoftGraphChange"};
-    auto safeMessages = inflateMessages(data).messages;
-    for (auto & safe : safeMessages) {
-        if (destination) safe->setRemoteFolder(destination.get());
-        if (movedGraphIds.count(safe->id())) safe->setGraphId(movedGraphIds[safe->id()]);
-        int remaining = max(0, safe->syncUnsavedChanges() - 1);
-        safe->setSyncUnsavedChanges(remaining);
-        if (remaining == 0) safe->setSyncedAt(time(0));
-        store->save(safe.get());
+    } catch (...) {
+        vector<shared_ptr<Message>> pending;
+        for (auto & msg : messages) if (!completed.count(msg->id())) pending.push_back(msg);
+        settleMessageChanges(pending, cname == "ChangeFolderTask", true);
+        throw;
     }
-    store->unsafeEraseTransactionDeltas();
-    transaction.commit();
 }
 
 void TaskProcessor::performRemoteSmarterMailChange(Task * task) {
@@ -924,39 +979,67 @@ void TaskProcessor::performRemoteSmarterMailChange(Task * task) {
     auto messages = inflateMessages(data).messages;
     SmarterMailClient client(account);
     shared_ptr<Folder> destination = nullptr;
+    set<string> completed;
+    try {
     if (cname == "ChangeFolderTask") {
         destination = store->find<Folder>(Query().equal("id", data["folder"]["id"].get<string>()));
         if (!destination) throw SyncException("invalid-smartermail-folder", "The SmarterMail destination folder is unavailable.", false);
     }
 
-    map<string, vector<uint32_t>> uidsByFolder;
+    map<string, vector<shared_ptr<Message>>> messagesByFolder;
+    bool unresolved = false;
     for (auto & message : messages) {
-        if (message->remoteUID() == 0 || message->remoteUID() > UINT32_MAX - 5) continue;
-        uidsByFolder[message->remoteFolder().value("path", "")].push_back(message->remoteUID());
-    }
-    for (const auto & entry : uidsByFolder) {
-        if (entry.first.empty() || entry.second.empty()) continue;
-        if (cname == "ChangeUnreadTask") client.markRead(entry.first, entry.second, !data["unread"].get<bool>());
-        else if (cname == "ChangeStarredTask") client.setFlagged(entry.first, entry.second, data["starred"].get<bool>());
-        else if (cname == "ChangeFolderTask") client.move(entry.first, entry.second, destination->path());
-    }
-
-    MailStoreTransaction transaction{store, "performRemoteSmarterMailChange"};
-    auto safeMessages = inflateMessages(data).messages;
-    for (auto & safe : safeMessages) {
-        if (destination) {
-            safe->setRemoteFolder(destination.get());
-            // SmarterMail UIDs are folder-local and a move may assign a new one.
-            // Mark it unlinked so the next successful listing reattaches by Message-ID.
-            safe->setRemoteUID(UINT32_MAX - 1);
+        if (destination && message->remoteFolderId() == destination->id()) {
+            settleMessageChanges({message}, true, false);
+            completed.insert(message->id());
+            continue;
         }
-        int remaining = max(0, safe->syncUnsavedChanges() - 1);
-        safe->setSyncUnsavedChanges(remaining);
-        if (remaining == 0) safe->setSyncedAt(time(0));
-        store->save(safe.get());
+        const string path = message->remoteFolder().value("path", "");
+        if (!MoveResult::uid(message->remoteUID()) || path.empty()) { unresolved = true; continue; }
+        messagesByFolder[path].push_back(message);
     }
-    store->unsafeEraseTransactionDeltas();
-    transaction.commit();
+    for (auto & entry : messagesByFolder) {
+        for (auto batch : MailUtils::chunksOfVector(entry.second, 100)) {
+            vector<uint32_t> uids;
+            for (auto & msg : batch) uids.push_back(msg->remoteUID());
+            if (cname == "ChangeUnreadTask") client.markRead(entry.first, uids, !data["unread"].get<bool>());
+            else if (cname == "ChangeStarredTask") client.setFlagged(entry.first, uids, data["starred"].get<bool>());
+            else if (destination) {
+                // Bounded metadata only: never scan an archive or download bodies.
+                // A pre-existing destination copy must not be mistaken for this move.
+                set<uint32_t> before;
+                for (auto & row : client.messages(destination->path(), 0, 200).messages)
+                    before.insert(MoveResult::rowUID(row));
+                const auto response = client.move(entry.first, uids, destination->path());
+                vector<json> after;
+                bool needsLookup = false;
+                for (auto & msg : batch) if (!MoveResult::mapped(response, msg->remoteUID())) needsLookup = true;
+                if (needsLookup) after = client.messages(destination->path(), 0, 200).messages;
+                vector<shared_ptr<Message>> confirmed;
+                set<uint32_t> assigned;
+                for (auto & msg : batch) {
+                    uint32_t uid = MoveResult::mapped(response, msg->remoteUID());
+                    if (!uid) uid = MoveResult::newlyObserved(after, before, msg->headerMessageId());
+                    if (!uid || !assigned.insert(uid).second) { unresolved = true; continue; }
+                    msg->setRemoteFolder(destination.get());
+                    msg->setRemoteUID(uid);
+                    confirmed.push_back(msg);
+                }
+                settleMessageChanges(confirmed, true, false);
+                for (auto & msg : confirmed) completed.insert(msg->id());
+                continue;
+            }
+            settleMessageChanges(batch, false, false);
+            for (auto & msg : batch) completed.insert(msg->id());
+        }
+    }
+    if (unresolved) throw SyncException("move-unconfirmed", "Some messages have unresolved server identities or unconfirmed moves. Refresh both folders before retrying.", false);
+    } catch (...) {
+        vector<shared_ptr<Message>> pending;
+        for (auto & msg : messages) if (!completed.count(msg->id())) pending.push_back(msg);
+        settleMessageChanges(pending, cname == "ChangeFolderTask", true);
+        throw;
+    }
 }
 
 void TaskProcessor::performLocalSaveDraft(Task * task) {
@@ -1669,6 +1752,73 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
     
     logger->info("- Sending draft {}", draft.headerMessageId());
 
+    if (account->usesSmarterMailAPI()) {
+        if (multisend) throw SyncException("smartermail-multisend-unsupported", "Per-recipient customized sends are not supported by the native SmarterMail send operation. Disable tracking/customization and try again; no email was sent.", false);
+        shared_ptr<Message> parent;
+        const auto localParent = draft._data.find("replyToMessageId");
+        if (localParent != draft._data.end() && localParent->is_string()) {
+            parent = store->find<Message>(Query().equal("accountId", account->id()).equal("id", localParent->get<string>()));
+        }
+        const string parentMid = draft.forwardedHeaderMessageId().empty() ? draft.replyToHeaderMessageId() : draft.forwardedHeaderMessageId();
+        if (!parent && !parentMid.empty()) parent = store->find<Message>(Query().equal("accountId", account->id()).equal("headerMessageId", parentMid));
+        auto payload = SmarterMailCompose::payload(draft, account->emailAddress(), body, plaintext, parent.get());
+        SmarterMailClient client(account);
+        const string composeGuid = SmarterMailCompose::guid();
+        json attachments = json::array(), names = json::array();
+        set<string> stagedNames;
+        for (auto & fileJSON : draft.files()) {
+            File file(fileJSON);
+            const string root = MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "files";
+            const string path = MailUtils::pathForFile(root, &file, false);
+#ifdef _MSC_VER
+            wstring_convert<codecvt_utf8<wchar_t>, wchar_t> convert;
+            auto attachment = Attachment::attachmentWithContentsOfFile(AS_WIDE_MCSTR(convert.from_bytes(path)));
+#else
+            auto attachment = Attachment::attachmentWithContentsOfFile(AS_MCSTR(path));
+#endif
+            if (!attachment || !attachment->data()) throw SyncException("smartermail-missing-attachment", "An attachment is unavailable; no email was sent.", false);
+            auto data = attachment->data();
+            const string bytes((const char *)data->bytes(), data->length());
+            const string type = file.contentType().empty() ? "application/octet-stream" : file.contentType();
+            // Match the reference client: embed inline images as data URLs;
+            // message-put's inline attachment flags are unreliable in Outlook.
+            if (!plaintext && file.contentId().is_string() && type.rfind("image/", 0) == 0) {
+                string cid = file.contentId().get<string>();
+                if (cid.size() > 2 && cid.front() == '<' && cid.back() == '>') cid = cid.substr(1, cid.size() - 2);
+                const string needle = "cid:" + cid;
+                const string replacement = "data:" + type + ";base64," + MailUtils::toBase64(bytes.data(), bytes.size());
+                size_t at = 0; bool embedded = false;
+                while (!cid.empty() && (at = body.find(needle, at)) != string::npos) {
+                    body.replace(at, needle.size(), replacement); at += replacement.size(); embedded = true;
+                }
+                if (embedded) continue;
+            }
+            const string filename = file.filename();
+            if (!stagedNames.insert(filename).second) throw SyncException("smartermail-duplicate-attachment-name", "Rename attachments with identical filenames before sending; no email was sent.", false);
+            client.uploadComposeAttachment(composeGuid, filename, type, bytes);
+            attachments.push_back({{"filename", filename}, {"fileName", filename}, {"Filename", filename}, {"FileName", filename},
+                {"attachmentName", filename}, {"AttachmentName", filename}, {"name", filename}, {"Name", filename},
+                {"contentType", type}, {"ContentType", type}, {"size", bytes.size()}, {"Size", bytes.size()}});
+            names.push_back(filename);
+        }
+        payload[plaintext ? "messagePlainText" : "messageHTML"] = body;
+        if (!attachments.empty()) {
+            payload["attachments"] = attachments; payload["attachmentNames"] = names; payload["attachmentGuid"] = composeGuid;
+        }
+        logger->info("-- Sending through SmarterMail message-put (reply={}, forward={}, attachments={})",
+            payload.value("isReply", false), payload.value("isForward", false), attachments.size());
+        client.sendMessage(payload);
+        // The server owns the Sent copy and its IDs. Never IMAP-append a second
+        // locally-built MIME copy or retry via SMTP after this point.
+        if (draft.remoteUID() && draft.remoteUID() <= UINT32_MAX - 5) {
+            try { client.remove(draft.remoteFolder().value("path", ""), {draft.remoteUID()}); }
+            catch (const SyncException &) { logger->warn("SmarterMail sent the message; remote draft cleanup failed."); }
+        }
+        if (existing) store->remove(existing.get());
+        MailUtils::wakeAllWorkers();
+        return;
+    }
+
     // find the sent folder: folder OR label
     auto sent = store->find<Folder>(Query().equal("accountId", account->id()).equal("role", "sent"));
     if (sent == nullptr) {
@@ -1704,12 +1854,41 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
     builder.header()->setUserAgent(MCSTR("SummerMail"));
     builder.header()->setDate(time(0));
     
-    // todo: lookup thread reference entire chain?
-
-    if (draft.replyToHeaderMessageId() != "") {
-        builder.header()->setReferences(Array::arrayWithObject(AS_MCSTR(draft.replyToHeaderMessageId())));
-        builder.header()->setInReplyTo(Array::arrayWithObject(AS_MCSTR(draft.replyToHeaderMessageId())));
-    }
+    ReplyHeaders::apply(builder.header(), draft, store, account->usesSmarterMailAPI(),
+        [&](Message * parent) -> MessageHeader * {
+            const string path = parent->remoteFolder().value("path", "");
+            if (path.empty() || parent->remoteUID() == 0) return nullptr;
+            if (account->usesSmarterMailAPI()) {
+                SmarterMailClient client(account);
+                auto detail = client.messageBody(path, parent->remoteUID());
+                auto parse = [](const string & mime) {
+                    return MessageParser::messageParserWithData(Data::dataWithBytes(mime.data(), (unsigned int)mime.size()))->header();
+                };
+                auto header = parse(detail.mime);
+                // Match the reference project's raw-header fallback. Do this
+                // at send time only when the parent's headers aren't verified.
+                if (header->isMessageIDAutoGenerated() || !header->references() || header->references()->count() == 0) {
+                    try {
+                        const string raw = client.rawMessage(path, parent->remoteUID());
+                        if (!raw.empty()) {
+                            auto rawHeader = parse(raw);
+                            if (!rawHeader->isMessageIDAutoGenerated()) header = rawHeader;
+                        }
+                    } catch (const SyncException &) {
+                        // A real root message may have no References. A missing
+                        // raw endpoint must not discard its valid JSON headers.
+                        if (header->isMessageIDAutoGenerated()) throw;
+                    }
+                }
+                return header;
+            }
+            ErrorCode fetchError = ErrorNone;
+            auto rows = session->fetchMessagesByUID(AS_MCSTR(path), IMAPMessagesRequestKindHeaders,
+                IndexSet::indexSetWithIndex(parent->remoteUID()), nullptr, &fetchError);
+            if (fetchError != ErrorNone) throw SyncException(fetchError, "reply parent headers");
+            if (!rows || rows->count() != 1) return nullptr;
+            return ((IMAPMessage *)rows->objectAtIndex(0))->header();
+        }, !account->usesMicrosoftGraph());
     if (draft.forwardedHeaderMessageId() != "") {
         builder.header()->setReferences(Array::arrayWithObject(AS_MCSTR(draft.forwardedHeaderMessageId())));
     }
@@ -1845,29 +2024,37 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
         }
     }
 
-    if (account->usesSmarterMailAPI()) {
+    IMAPSession smarterMailSentSession;
+    IMAPSession * sentSession = session;
+    const bool smarterMailSend = account->usesSmarterMailAPI();
+    if (smarterMailSend) {
         SmarterMailClient client(account);
-        try {
-            string mime((const char *)messageDataForSent->bytes(), messageDataForSent->length());
-            client.importMime(sent->path(), mime);
-        } catch (SyncException & ex) {
-            // SMTP delivery already succeeded. A Sent-folder archival failure must
-            // never turn into a retryable send and deliver the message twice.
-            logger->error("SmarterMail accepted the SMTP send but the Sent copy could not be saved: {}", ex.toJSON().dump());
-        }
         if (draft.remoteUID() != 0 && draft.remoteUID() <= UINT32_MAX - 5) {
             try { client.remove(draft.remoteFolder().value("path", ""), {draft.remoteUID()}); }
             catch (SyncException & ex) { logger->warn("Could not remove the SmarterMail draft after send: {}", ex.toJSON().dump()); }
         }
-        if (existing) store->remove(existing.get());
-        return;
+
+        // SmarterMail's REST MIME-import routes are compatibility probes and are
+        // not implemented by the supported v17 server. The reference client saves
+        // the already-delivered RFC822 message with a narrow IMAP APPEND instead.
+        // Mail listing and body sync remain on the native API.
+        MailUtils::configureSessionForAccount(smarterMailSentSession, account);
+        smarterMailSentSession.connect(&err);
+        if (err != ErrorNone) {
+            logger->error("-X SmarterMail accepted the SMTP send, but IMAP could not connect to archive the Sent copy: {}",
+                          ErrorCodeToTypeMap[err]);
+            store->remove(&draft);
+            return;
+        }
+        sentSession = &smarterMailSentSession;
+        err = ErrorNone;
     }
     
     /* 
      Sending complete! First, delete the draft from the server so the user knows it has been sent
      and we don't re-sync it to the app after we delete it below.
      */
-    if (draft.remoteUID() != 0) {
+    if (!smarterMailSend && draft.remoteUID() != 0) {
         auto uids = IndexSet::indexSetWithIndex(draft.remoteUID());
         String * path = AS_MCSTR(draft.remoteFolder()["path"].get<string>());
         
@@ -1880,7 +2067,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
      folder, others don't.
      */
     uint32_t sentFolderMessageUID = 0;
-    {
+    if (!smarterMailSend) {
         // grab the last few items in the sent folder... we know we don't need more than 10
         // because multisend is capped.
         int tries = 0;
@@ -1893,7 +2080,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
 				std::this_thread::sleep_for(std::chrono::seconds(delay[tries]));
             }
             tries ++;
-            session->findUIDsOfRecentHeaderMessageID(sentPath, AS_MCSTR(draft.headerMessageId()), uids);
+            sentSession->findUIDsOfRecentHeaderMessageID(sentPath, AS_MCSTR(draft.headerMessageId()), uids);
         }
     
         if (multisend && (uids->count() > 0)) {
@@ -1907,7 +2094,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
             auto all = store->find<Folder>(Query().equal("accountId", account->id()).equal("role", "all"));
             if (all != nullptr) {
                 uids->removeAllIndexes();
-                session->findUIDsOfRecentHeaderMessageID(AS_MCSTR(all->path()), AS_MCSTR(draft.headerMessageId()), uids);
+                sentSession->findUIDsOfRecentHeaderMessageID(AS_MCSTR(all->path()), AS_MCSTR(draft.headerMessageId()), uids);
                 if (uids->count() > 0) {
                     logger->info("-- Deleting {} messages just moved to {} by the SMTP gateway.", uids->count(), all->path());
                     _removeMessagesResilient(session, store, account->id(), AS_MCSTR(all->path()), uids);
@@ -1933,7 +2120,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
         // Manually place a single message in the sent folder
         IMAPProgress iprogress;
         logger->info("-- Placing a new message with `self` body in the sent folder.");
-        session->appendMessage(sentPath, messageDataForSent, MessageFlagSeen, &iprogress, &sentFolderMessageUID, &err);
+        sentSession->appendMessage(sentPath, messageDataForSent, MessageFlagSeen, &iprogress, &sentFolderMessageUID, &err);
         if (err != ErrorNone) {
             logger->error("-X IMAP Error: {}. Could not place a message into the Sent folder. This means no metadata will be attached!", ErrorCodeToTypeMap[err]);
             err = ErrorNone;
@@ -1942,7 +2129,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
         // If the user is on Gmail and the thread had labels, apply those same
         // labels to the new sent message. Otherwise the thread moves /only/ to
         // the sent folder.
-        if (session->storedCapabilities()->containsIndex(IMAPCapabilityGmail)) {
+        if (sentSession->storedCapabilities()->containsIndex(IMAPCapabilityGmail)) {
             if (draft.threadId() != "") {
                 auto thread = store->find<Thread>(Query().equal("id", draft.threadId()));
                 if (thread) {
@@ -1954,7 +2141,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
                         logger->info("-- Will add label to new message: {}", xgm);
                         xgmValues->addObject(AS_MCSTR(xgm));
                     }
-                    session->storeLabelsByUID(sentPath, IndexSet::indexSetWithIndex(sentFolderMessageUID), IMAPStoreFlagsRequestKindAdd, xgmValues, &err);
+                    sentSession->storeLabelsByUID(sentPath, IndexSet::indexSetWithIndex(sentFolderMessageUID), IMAPStoreFlagsRequestKindAdd, xgmValues, &err);
                     if (err != ErrorNone) {
                         logger->error("-X IMAP Error: {}. Could not add labels to new message in sent folder. This means the thread may disappear from the inbox.", ErrorCodeToTypeMap[err]);
                         err = ErrorNone;
@@ -1986,18 +2173,18 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
     
     logger->info("-- Syncing sent message (UID {}) to the local mail store", sentFolderMessageUID);
     IMAPMessagesRequestKind kind = (IMAPMessagesRequestKind)(IMAPMessagesRequestKindHeaders | IMAPMessagesRequestKindFlags);
-    if (session->storedCapabilities()->containsIndex(IMAPCapabilityGmail)) {
+    if (sentSession->storedCapabilities()->containsIndex(IMAPCapabilityGmail)) {
         kind = (IMAPMessagesRequestKind)(kind | IMAPMessagesRequestKindGmailLabels | IMAPMessagesRequestKindGmailThreadID | IMAPMessagesRequestKindGmailMessageID);
     }
     
     // Important: Courier (and maybe other IMAP servers) won't show us new messages we've created
     // in the folder unless we re-select the folder. (I think they're treating UIDs like sequence
     // numbers?). We must re-select the sent folder to pull down the message we created.
-    session->select(sentPath, &err);
+    sentSession->select(sentPath, &err);
 
     time_t syncDataTimestamp = time(0);
     IndexSet * uids = IndexSet::indexSetWithIndex(sentFolderMessageUID);
-    Array * remote = session->fetchMessagesByUID(sentPath, kind, uids, nullptr, &err);
+    Array * remote = sentSession->fetchMessagesByUID(sentPath, kind, uids, nullptr, &err);
 
     // Delete the draft. We do this as close as possible to when we write the message in
     // so there isn't any flicker in the client, but before error checking because we always

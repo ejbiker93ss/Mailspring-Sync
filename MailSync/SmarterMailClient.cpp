@@ -33,11 +33,13 @@ string normalizedBase(string value) {
     return value;
 }
 
-json performJSON(const string & url, const string & method, const string & token, const json & payload) {
+json performJSON(const string & url, const string & method, const string & token, const json & payload, long timeout = 0) {
     string serialized = payload.is_null() ? "" : payload.dump();
-    HTTPResponse response = PerformRequestWithStatus(CreateJSONRequest(
+    CURL * request = CreateJSONRequest(
         url, method, token.empty() ? "" : "Bearer " + token,
-        serialized.empty() ? nullptr : serialized.c_str()));
+        serialized.empty() ? nullptr : serialized.c_str());
+    if (timeout) curl_easy_setopt(request, CURLOPT_TIMEOUT, timeout);
+    HTTPResponse response = PerformRequestWithStatus(request);
     if (response.status < 200 || response.status > 209) {
         throw SyncException("smartermail-http-" + to_string(response.status),
             url + " returned HTTP " + to_string(response.status), response.status != 401 && response.status != 403);
@@ -173,7 +175,7 @@ void SmarterMailClient::authenticate(bool force) {
         {"twoFactorCode", ""},
         {"clientId", clientIdFor(account->id())}
     };
-    json response = performJSON(baseUrl + "/auth/authenticate-user", "POST", "", payload);
+    json response = performJSON(baseUrl + "/auth/authenticate-user", "POST", "", payload, requestTimeout);
     requireSuccess(response, "Authentication");
     string accessToken = response.value("accessToken", "");
     if (accessToken.empty()) {
@@ -189,7 +191,7 @@ void SmarterMailClient::authenticate(bool force) {
 json SmarterMailClient::requestJSON(const string & path, const string & method, const json & payload) {
     authenticate();
     try {
-        json response = performJSON(baseUrl + path, method, tokenFor(account->id()), payload);
+        json response = performJSON(baseUrl + path, method, tokenFor(account->id()), payload, requestTimeout);
         requireSuccess(response, path);
         return response;
     } catch (SyncException & first) {
@@ -197,7 +199,7 @@ json SmarterMailClient::requestJSON(const string & path, const string & method, 
         // Tokens are process-local and can expire at any point. Re-authenticate once;
         // a repeated transport or API failure is allowed to propagate to the worker.
         authenticate(true);
-        json response = performJSON(baseUrl + path, method, tokenFor(account->id()), payload);
+        json response = performJSON(baseUrl + path, method, tokenFor(account->id()), payload, requestTimeout);
         requireSuccess(response, path);
         return response;
     }
@@ -254,6 +256,34 @@ SmarterMailPage SmarterMailClient::messages(const string & folder, unsigned int 
     return page;
 }
 
+void SmarterMailClient::sendMessage(const json & payload) {
+    // No SMTP fallback/retry after an ambiguous submission: it could duplicate delivery.
+    requestJSON("/mail/message-put", "POST", payload);
+}
+
+void SmarterMailClient::uploadComposeAttachment(const string & guid, const string & filename,
+                                               const string & contentType, const string & bytes) {
+    authenticate();
+    CURL * request = CreateJSONRequest(baseUrl + "/mail/attachment/" + guid, "POST", "Bearer " + tokenFor(account->id()));
+    curl_mime * form = curl_mime_init(request);
+    curl_mimepart * part = curl_mime_addpart(form);
+    curl_mime_name(part, "file");
+    curl_mime_filename(part, filename.c_str());
+    curl_mime_type(part, contentType.c_str());
+    curl_mime_data(part, bytes.data(), bytes.size());
+    curl_easy_setopt(request, CURLOPT_MIMEPOST, form);
+    HTTPResponse response;
+    try { response = PerformRequestWithStatus(request); }
+    catch (...) { curl_mime_free(form); throw; }
+    curl_mime_free(form);
+    if (response.status < 200 || response.status >= 300)
+        throw SyncException("smartermail-attachment-upload", "SmarterMail rejected the attachment upload; no message was sent.", false);
+    if (!response.body.empty()) {
+        try { requireSuccess(json::parse(response.body), "Attachment upload"); }
+        catch (const json::exception &) {} // Some supported builds return an empty/plain success response.
+    }
+}
+
 SmarterMailMessageBody SmarterMailClient::messageBody(const string & folder, uint32_t uid) {
     json response = requestJSON("/mail/message", "POST", {
         {"ownerEmailAddress", account->emailAddress()}, {"folder", folder}, {"uid", uid}
@@ -269,6 +299,17 @@ SmarterMailMessageBody SmarterMailClient::messageBody(const string & folder, uin
         return result;
     }
     if (!detail.is_object()) return result;
+
+    for (const char * key : {"replyUid", "replyUID", "replyToUid", "inReplyToUid"}) {
+        if (!detail.count(key)) continue;
+        try {
+            const auto uid = detail[key].is_string() ? stoull(detail[key].get<string>()) : detail[key].get<uint64_t>();
+            if (uid > 0 && uid < UINT32_MAX - 5) { result.replyUid = (uint32_t)uid; break; }
+        } catch (...) {}
+    }
+    for (const char * key : {"replyFromFolder", "replyFolder", "replyToFolder"})
+        if (detail.count(key) && detail[key].is_string() && !detail[key].get<string>().empty()) { result.replyFolder = detail[key].get<string>(); break; }
+    if (detail.count("replyOwner") && detail["replyOwner"].is_string()) result.replyOwner = detail["replyOwner"].get<string>();
 
     auto bodyValue = [&detail](initializer_list<const char *> keys) {
         for (const char * key : keys) {
@@ -293,6 +334,57 @@ SmarterMailMessageBody SmarterMailClient::messageBody(const string & folder, uin
         (detail.count("attachments") && detail["attachments"].is_array() && !detail["attachments"].empty()) ||
         (detail.count("hasAttachments") && detail["hasAttachments"].is_boolean() && detail["hasAttachments"].get<bool>());
     return result;
+}
+
+nlohmann::json SmarterMailClient::taskOperation(const json & request) {
+    requestTimeout = 15;
+    const string operation = request.at("operation").get<string>();
+    const auto sources = requestJSON("/tasks/sources").at("sources");
+    if (operation == "sources") return sources;
+    const string sourceId = request.at("sourceId").get<string>();
+    const string owner = request.at("owner").get<string>();
+    json source;
+    for (const auto & candidate : sources)
+        if (candidate.value("id", string()) == sourceId && candidate.value("owner", string()) == owner) source = candidate;
+    if (source.is_null()) throw SyncException("task-source-unavailable", "Task list is no longer available. Refresh the lists.", false);
+    if (operation == "list") {
+        return requestJSON("/tasks/tasks-all", "POST", {{"sources", json::array({{{"owner", owner}, {"id", sourceId}}})},
+            {"searchParams", {{"skip", max(0, request.value("skip", 0))}, {"take", 100}, {"search", ""},
+                {"sortField", "subject"}, {"sortDescending", false}, {"categories", json::array()},
+                {"showNonCategorized", true}, {"filterFlags", json::object()}}}});
+    }
+    const string id = request.value("taskId", string());
+    auto segment = [](const string & value) { CURL * c = curl_easy_init(); char * p = curl_easy_escape(c, value.c_str(), (int)value.size()); string s(p); curl_free(p); curl_easy_cleanup(c); return s; };
+    const string detailPath = "/tasks/" + segment(owner) + "/" + segment(sourceId) + "/" + segment(id);
+    if (operation == "detail") return requestJSON(detailPath);
+    // Shared task lists remain readable. Do not infer write rights from visibility.
+    if (source.value("isSharedItem", false) || owner != account->emailAddress())
+        throw SyncException("task-list-read-only", "Edit shared tasks in SmarterMail webmail.", false);
+    if (operation != "save" && operation != "delete") throw SyncException("invalid-task-operation", "Unsupported task operation.", false);
+    json task = {{"sourceOwner", owner}, {"sourceId", sourceId}, {"subject", ""}, {"description", ""},
+        {"status", 0}, {"percentComplete", 0}, {"priority", 5}, {"useDateTime", false}, {"reminderSet", false}};
+    if (!id.empty()) {
+        const auto details = requestJSON(detailPath).at("details");
+        if (details.empty()) throw SyncException("task-not-found", "Task no longer exists. Refresh the list.", false);
+        task = details.at(0); // Preserve recurrence, attachments and other unedited fields.
+        if (task.value("id", string()) != id || task.value("sourceId", string()) != sourceId || task.value("sourceOwner", string()) != owner)
+            throw SyncException("task-identity-mismatch", "Task identity changed. Refresh the list.", false);
+        if (task.value("isDelegatedByOwner", false))
+            throw SyncException("task-read-only", "Edit this delegated task in webmail.", false);
+    }
+    if (operation == "delete") {
+        if (id.empty()) throw SyncException("task-id-required", "Select a task to delete.", false);
+        return requestJSON("/tasks/delete", "POST", json::array({{{"sourceOwner", owner}, {"sourceId", sourceId}, {"id", id}}}));
+    }
+    const auto changes = request.at("changes");
+    for (const char * key : {"subject", "description", "due", "start", "useDateTime", "priority", "status", "percentComplete"})
+        if (changes.count(key)) task[key] = changes[key];
+    if (!task["subject"].is_string() || task["subject"].get<string>().empty())
+        throw SyncException("task-title-required", "Enter a task title.", false);
+    const auto saved = requestJSON("/tasks/save", "POST", json::array({task}));
+    if (!saved.is_array() || saved.empty() || saved.at(0).value("id", string()).empty())
+        throw SyncException("task-save-unconfirmed", "The server did not confirm the saved task. Refresh before retrying.", false);
+    return saved;
 }
 
 string SmarterMailClient::rawMessage(const string & folder, uint32_t uid) {
