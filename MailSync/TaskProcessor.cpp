@@ -1016,6 +1016,22 @@ void TaskProcessor::performRemoteSmarterMailChange(Task * task) {
             if (cname == "ChangeUnreadTask") client.markRead(entry.first, uids, !data["unread"].get<bool>());
             else if (cname == "ChangeStarredTask") client.setFlagged(entry.first, uids, data["starred"].get<bool>());
             else if (destination) {
+                // SmarterMail confirms a delete-to-Trash through delete-messages,
+                // but does not return the destination UID mapping supplied by a
+                // regular move. Do not route deletes through the move path and
+                // turn a successful server delete into an "unconfirmed" error.
+                // The sentinel keeps the item out of further mutations until the
+                // next Trash refresh reconciles its server-assigned UID.
+                if (destination->role() == "trash") {
+                    client.remove(entry.first, uids, true);
+                    for (auto & msg : batch) {
+                        msg->setRemoteFolder(destination.get());
+                        msg->setRemoteUID(UINT32_MAX - 1);
+                    }
+                    settleMessageChanges(batch, true, false);
+                    for (auto & msg : batch) completed.insert(msg->id());
+                    continue;
+                }
                 // Bounded metadata only: never scan an archive or download bodies.
                 // A pre-existing destination copy must not be mistaken for this move.
                 set<uint32_t> before;
