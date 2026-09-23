@@ -330,9 +330,30 @@ SmarterMailMessageBody SmarterMailClient::messageBody(const string & folder, uin
     const string text = bodyValue({"messagePlainText", "textBody", "plainText"});
     result.mime = SmarterMailRawMessage::structuredBodyMime(html, text);
     if (!result.mime.empty()) result.mime = SmarterMailHeaders::mime(detail) + result.mime;
-    result.hasAttachments =
-        (detail.count("attachments") && detail["attachments"].is_array() && !detail["attachments"].empty()) ||
-        (detail.count("hasAttachments") && detail["hasAttachments"].is_boolean() && detail["hasAttachments"].get<bool>());
+    // The detail and list APIs do not use a perfectly consistent shape across
+    // SmarterMail versions. Treat either the explicit flag or a non-empty
+    // attachment collection as authoritative. This is deliberately only a
+    // hint: the sync worker uses it to decide whether the heavier RFC822 fetch
+    // is necessary to preserve MIME parts and Content-IDs.
+    auto attachmentFlag = [&detail](const char * key) {
+        if (!detail.count(key) || detail[key].is_null()) return false;
+        const auto & value = detail[key];
+        if (value.is_boolean()) return value.get<bool>();
+        if (value.is_number()) return value.get<double>() != 0;
+        if (value.is_string()) {
+            string text = value.get<string>();
+            transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return (char)tolower(c); });
+            return text == "true" || text == "1" || text == "yes";
+        }
+        return false;
+    };
+    result.hasAttachments = attachmentFlag("hasAttachments") || attachmentFlag("hasAttachment");
+    for (const char * key : {"attachments", "attachmentList", "messageAttachments"}) {
+        if (detail.count(key) && detail[key].is_array() && !detail[key].empty()) {
+            result.hasAttachments = true;
+            break;
+        }
+    }
     return result;
 }
 
