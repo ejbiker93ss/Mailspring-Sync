@@ -13,6 +13,7 @@
 #define MailProcessor_hpp
 
 #include <stdio.h>
+#include <functional>
 
 #include <MailCore/MailCore.h>
 #include <SQLiteCpp/SQLiteCpp.h>
@@ -41,7 +42,8 @@ public:
     shared_ptr<Message> insertFallbackToUpdateMessage(IMAPMessage * mMsg, Folder & folder, time_t syncDataTimestamp);
     shared_ptr<Message> insertMessage(IMAPMessage * mMsg, Folder & folder, time_t syncDataTimestamp);
     void updateMessage(Message * local, IMAPMessage * remote, Folder & folder, time_t syncDataTimestamp);
-    void retrievedMessageBody(Message * message, MessageParser * parser);
+    bool retrievedMessageBody(Message * message, MessageParser * parser,
+                              const function<string(const string &)> & htmlTransform = nullptr);
     void repairSmarterMailThread(Message * message, MessageHeader * header, const string & parentMessageId = "");
     bool retrievedFileData(File * file, Data * data);
     void unlinkMessagesMatchingQuery(Query & query, int phase);

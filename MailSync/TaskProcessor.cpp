@@ -998,7 +998,7 @@ void TaskProcessor::performRemoteSmarterMailChange(Task * task) {
     }
 
     map<string, vector<shared_ptr<Message>>> messagesByFolder;
-    bool unresolved = false;
+    bool unresolvedIdentity = false;
     for (auto & message : messages) {
         if (destination && message->remoteFolderId() == destination->id()) {
             settleMessageChanges({message}, true, false);
@@ -1006,7 +1006,7 @@ void TaskProcessor::performRemoteSmarterMailChange(Task * task) {
             continue;
         }
         const string path = message->remoteFolder().value("path", "");
-        if (!MoveResult::uid(message->remoteUID()) || path.empty()) { unresolved = true; continue; }
+        if (!MoveResult::uid(message->remoteUID()) || path.empty()) { unresolvedIdentity = true; continue; }
         messagesByFolder[path].push_back(message);
     }
     for (auto & entry : messagesByFolder) {
@@ -1032,35 +1032,42 @@ void TaskProcessor::performRemoteSmarterMailChange(Task * task) {
                     for (auto & msg : batch) completed.insert(msg->id());
                     continue;
                 }
-                // Bounded metadata only: never scan an archive or download bodies.
-                // A pre-existing destination copy must not be mistaken for this move.
-                set<uint32_t> before;
-                for (auto & row : client.messages(destination->path(), 0, 200).messages)
-                    before.insert(MoveResult::rowUID(row));
                 const auto response = client.move(entry.first, uids, destination->path());
-                vector<json> after;
-                bool needsLookup = false;
-                for (auto & msg : batch) if (!MoveResult::mapped(response, msg->remoteUID())) needsLookup = true;
-                if (needsLookup) after = client.messages(destination->path(), 0, 200).messages;
-                vector<shared_ptr<Message>> confirmed;
+                vector<shared_ptr<Message>> accepted;
                 set<uint32_t> assigned;
+                size_t awaitingReconciliation = 0;
                 for (auto & msg : batch) {
                     uint32_t uid = MoveResult::mapped(response, msg->remoteUID());
-                    if (!uid) uid = MoveResult::newlyObserved(after, before, msg->headerMessageId());
-                    if (!uid || !assigned.insert(uid).second) { unresolved = true; continue; }
                     msg->setRemoteFolder(destination.get());
-                    msg->setRemoteUID(uid);
-                    confirmed.push_back(msg);
+                    if (uid && assigned.insert(uid).second) {
+                        msg->setRemoteUID(uid);
+                    } else {
+                        // A successful SmarterMail move commonly omits the new UID.
+                        // Do not scan a potentially huge destination folder or report
+                        // a false failure. The sentinel prevents later mutations from
+                        // targeting the stale source UID while normal bounded folder
+                        // synchronization discovers the authoritative destination row.
+                        msg->setRemoteUID(UINT32_MAX - 1);
+                        awaitingReconciliation++;
+                    }
+                    accepted.push_back(msg);
                 }
-                settleMessageChanges(confirmed, true, false);
-                for (auto & msg : confirmed) completed.insert(msg->id());
+                settleMessageChanges(accepted, true, false);
+                for (auto & msg : accepted) completed.insert(msg->id());
+                if (awaitingReconciliation) {
+                    logger->info("SmarterMail accepted {} move(s) without destination UID mappings; queued for reconciliation.", awaitingReconciliation);
+                }
                 continue;
             }
             settleMessageChanges(batch, false, false);
             for (auto & msg : batch) completed.insert(msg->id());
         }
     }
-    if (unresolved) throw SyncException("move-unconfirmed", "Some messages have unresolved server identities or unconfirmed moves. Refresh both folders before retrying.", false);
+    if (unresolvedIdentity) {
+        if (cname == "ChangeFolderTask")
+            throw SyncException("move-unconfirmed", "Some messages do not yet have usable server identities. Refresh both folders before retrying.", false);
+        throw SyncException("message-identity-unavailable", "Some messages need to synchronize before this change can be applied.", false);
+    }
     } catch (...) {
         vector<shared_ptr<Message>> pending;
         for (auto & msg : messages) if (!completed.count(msg->id())) pending.push_back(msg);

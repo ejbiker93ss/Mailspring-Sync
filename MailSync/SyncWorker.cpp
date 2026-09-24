@@ -1192,29 +1192,6 @@ void SyncWorker::syncSmarterMailMessageBody(Message * message, bool background)
     const bool hasAttachments = body.hasAttachments || message->_data.value("smHasAttachments", false);
     bool attachmentMimeLoaded = !hasAttachments;
     bool usedRawMime = false;
-    if (hasAttachments) {
-        // SmarterMail's detail endpoint gives us a fast display body but does
-        // not carry MIME parts. The legacy client stores downloaded files only
-        // while parsing RFC822, so get the raw source only for messages that
-        // advertise attachments. This also gives cid: images their binary
-        // parts and Content-ID mapping without taxing ordinary message opens.
-        try {
-            const string raw = client.rawMessage(path, message->remoteUID());
-            if (!raw.empty()) {
-                body.mime = raw;
-                attachmentMimeLoaded = true;
-                usedRawMime = true;
-            }
-        } catch (SyncException & ex) {
-            // A text-only structured response remains useful. Do not turn a
-            // missing compatibility endpoint into a blank message, and leave
-            // the hydration marker unset so the bounded background pass can
-            // try again later.
-            if (body.mime.empty()) throw;
-            logger->warn("SmarterMail attachment MIME unavailable for UID {}; keeping structured body: {}",
-                message->remoteUID(), ex.toJSON().dump());
-        }
-    }
     if (body.mime.empty()) {
         // Raw RFC822 is a compatibility fallback only. Running it beside or
         // after a valid structured response makes SmarterMail serialize extra
@@ -1222,10 +1199,150 @@ void SyncWorker::syncSmarterMailMessageBody(Message * message, bool background)
         body.mime = client.rawMessage(path, message->remoteUID());
         usedRawMime = true;
     }
-    Data * data = Data::dataWithBytes(body.mime.data(), (unsigned int)body.mime.size());
-    MessageParser * parser = MessageParser::messageParserWithData(data);
-    if (!parser) throw SyncException("invalid-smartermail-message", "SmarterMail returned invalid MIME content.", true);
-    processor->retrievedMessageBody(message, parser);
+    auto parseAndStore = [&](const string & mime) {
+        Data * data = Data::dataWithBytes(mime.data(), (unsigned int)mime.size());
+        MessageParser * parsed = MessageParser::messageParserWithData(data);
+        if (!parsed) throw SyncException("invalid-smartermail-message", "SmarterMail returned invalid MIME content.", true);
+        const bool stored = processor->retrievedMessageBody(message, parsed, [&client](const string & html) {
+            return client.materializeInlineImageUrls(html);
+        });
+        return make_pair(parsed, stored);
+    };
+    auto parsedBody = parseAndStore(body.mime);
+    MessageParser * parser = parsedBody.first;
+    bool bodyStored = parsedBody.second;
+    if (!bodyStored && !usedRawMime) {
+        // The structured endpoint sometimes supplies only a closing MIME
+        // boundary. Its raw route contains the real multipart body, but is
+        // intentionally reserved for this malformed-body fallback.
+        const string raw = client.rawMessage(path, message->remoteUID());
+        if (!raw.empty()) {
+            usedRawMime = true;
+            parsedBody = parseAndStore(raw);
+            parser = parsedBody.first;
+            bodyStored = parsedBody.second;
+        }
+    }
+    if (!bodyStored) {
+        message->_data["smAttachmentHydratedV1"] = false;
+        store->save(message);
+        logger->warn("SmarterMail invalid body response for UID {}: {}",
+            message->remoteUID(), body.responseShape);
+        throw SyncException("smartermail-invalid-body", "SmarterMail returned an invalid message body.", true);
+    }
+    if (hasAttachments && !body.attachments.empty()) {
+        // SmarterMail's structured response already supplies stable attachment
+        // metadata and authenticated download links. Materialize those files
+        // directly instead of requiring the server's unreliable raw-MIME
+        // endpoint. Bound both count and aggregate bytes for large messages.
+        vector<File> files;
+        bool allAttachmentsLoaded = body.attachments.size() <= 32;
+        size_t totalBytes = 0;
+        const size_t attachmentCount = min<size_t>(body.attachments.size(), 32);
+        for (size_t index = 0; index < attachmentCount; ++index) {
+            const auto & descriptor = body.attachments[index];
+            try {
+                const string bytes = client.attachmentBytes(descriptor, path, message->remoteUID(), index);
+                totalBytes += bytes.size();
+                if (totalBytes > 100ULL * 1024 * 1024) {
+                    allAttachmentsLoaded = false;
+                    break;
+                }
+                string filename = "attachment";
+                for (const char * key : {"filename", "fileName", "name"}) {
+                    if (descriptor.count(key) && descriptor[key].is_string() && !descriptor[key].get<string>().empty()) {
+                        filename = descriptor[key].get<string>();
+                        break;
+                    }
+                }
+                Data * data = Data::dataWithBytes(bytes.data(), (unsigned int)bytes.size());
+                Attachment * attachment = Attachment::attachmentWithData(AS_MCSTR(filename), data);
+                string partId = to_string(index);
+                for (const char * key : {"partID", "partId", "index"}) {
+                    if (!descriptor.count(key)) continue;
+                    try {
+                        partId = descriptor[key].is_string()
+                            ? descriptor[key].get<string>()
+                            : to_string(descriptor[key].get<uint64_t>());
+                        break;
+                    } catch (...) {}
+                }
+                attachment->setPartID(AS_MCSTR(partId));
+                for (const char * key : {"contentType", "mimeType"}) {
+                    if (descriptor.count(key) && descriptor[key].is_string() &&
+                        descriptor[key].get<string>().find('/') != string::npos) {
+                        attachment->setMimeType(AS_MCSTR(descriptor[key].get<string>()));
+                        break;
+                    }
+                }
+                bool isInline = false;
+                for (const char * key : {"isInline", "inline", "isEmbedded"}) {
+                    if (descriptor.count(key) && descriptor[key].is_boolean() && descriptor[key].get<bool>()) {
+                        isInline = true;
+                        break;
+                    }
+                }
+                if (isInline) {
+                    attachment->setInlineAttachment(true);
+                    for (const char * key : {"contentId", "contentID", "cid", "contentIdentifier"}) {
+                        if (descriptor.count(key) && descriptor[key].is_string() && !descriptor[key].get<string>().empty()) {
+                            attachment->setContentID(AS_MCSTR(descriptor[key].get<string>()));
+                            break;
+                        }
+                    }
+                }
+                File file(message, attachment);
+                if (!processor->retrievedFileData(&file, data)) {
+                    allAttachmentsLoaded = false;
+                    continue;
+                }
+                files.push_back(file);
+            } catch (SyncException & ex) {
+                allAttachmentsLoaded = false;
+                logger->warn("SmarterMail attachment {} unavailable for UID {}: {}",
+                    index, message->remoteUID(), ex.toJSON().dump());
+            }
+        }
+        if (!files.empty()) {
+            MailStoreTransaction transaction{store, "smarterMailStructuredAttachments"};
+            for (auto & file : files) {
+                try { store->save(&file); }
+                catch (SQLite::Exception &) {
+                    logger->info("SmarterMail attachment file {} already exists", file.id());
+                }
+            }
+            message->setFiles(files);
+            store->save(message);
+            transaction.commit();
+        }
+        attachmentMimeLoaded = allAttachmentsLoaded && files.size() == body.attachments.size();
+    }
+    if (hasAttachments && body.attachments.empty() && !usedRawMime) {
+        // The structured response is the authoritative, fast display body and
+        // has already been committed above. Attachment MIME is an optional
+        // enhancement: a malformed raw-content response must never replace a
+        // valid body or leave the reading pane spinning.
+        try {
+            const string raw = client.rawMessage(path, message->remoteUID());
+            if (!raw.empty()) {
+                auto rawBody = parseAndStore(raw);
+                if (rawBody.second) {
+                    body.mime = raw;
+                    parser = rawBody.first;
+                    attachmentMimeLoaded = true;
+                    usedRawMime = true;
+                } else {
+                    logger->warn("SmarterMail attachment MIME was malformed for UID {}; keeping structured body",
+                        message->remoteUID());
+                }
+            }
+        } catch (SyncException & ex) {
+            // Keep the successfully stored body and leave the hydration marker
+            // unset so a later bounded pass may recover the attachment parts.
+            logger->warn("SmarterMail attachment MIME unavailable for UID {}; keeping structured body: {}",
+                message->remoteUID(), ex.toJSON().dump());
+        }
+    }
     auto header = parser->header();
     string subject = message->subject();
     transform(subject.begin(), subject.end(), subject.begin(), ::tolower);

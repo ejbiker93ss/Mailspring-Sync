@@ -10,6 +10,7 @@
 //
 
 #include "MailProcessor.hpp"
+#include "SmarterMailRawMessage.hpp"
 #include "MailStoreTransaction.hpp"
 #include "MailUtils.hpp"
 #include "File.hpp"
@@ -454,10 +455,12 @@ void MailProcessor::repairSmarterMailThread(Message * message, MessageHeader * h
     transaction.commit();
 }
 
-void MailProcessor::retrievedMessageBody(Message * message, MessageParser * parser) {
+bool MailProcessor::retrievedMessageBody(Message * message, MessageParser * parser,
+                                         const function<string(const string &)> & htmlTransform) {
     CleanHTMLBodyRendererTemplateCallback * htmlCallback = new CleanHTMLBodyRendererTemplateCallback();
     const char * bodyRepresentation;
     bool bodyIsPlaintext;
+    string transformedBody;
     
     Array * partAttachments = Array::array();
     Array * htmlInlineAttachments = Array::array();
@@ -469,13 +472,13 @@ void MailProcessor::retrievedMessageBody(Message * message, MessageParser * pars
     if (html == NULL) {
         logger->warn("Failed to render message body for message {}: parser returned null", message->id());
         MC_SAFE_RELEASE(htmlCallback);
-        return;
+        return false;
     }
     String * text = html;
 
     if (html->hasPrefix(MCSTR("PLAINTEXT:"))) {
         text = html->substringFromIndex(10);
-        bodyRepresentation = text->UTF8Characters();
+        transformedBody = text->UTF8Characters();
         bodyIsPlaintext = true;
     } else {
         String * flattenedHTML = html->flattenHTML();
@@ -485,10 +488,21 @@ void MailProcessor::retrievedMessageBody(Message * message, MessageParser * pars
             // flattenHTML failed, use empty string to avoid crash
             text = MCSTR("");
         }
-        bodyRepresentation = html->UTF8Characters();
+        transformedBody = html->UTF8Characters();
         bodyIsPlaintext = false;
     }
+    if (!bodyIsPlaintext && htmlTransform) transformedBody = htmlTransform(transformedBody);
+    bodyRepresentation = transformedBody.c_str();
     MC_SAFE_RELEASE(htmlCallback);
+
+    // A few SmarterMail builds return a final MIME delimiter as their
+    // structured body. MailCore accepts that fragment as plaintext, so reject
+    // it here before it can poison the local cache. The caller can then use
+    // the full raw MIME representation for this exceptional message only.
+    if (SmarterMailRawMessage::isClosingBoundaryOnly(transformedBody)) {
+        logger->warn("Rejected closing MIME boundary returned as message body for {}", message->id());
+        return false;
+    }
 
     // build file containers for the attachments and write them to disk
     Array attachments = Array();
@@ -609,6 +623,7 @@ void MailProcessor::retrievedMessageBody(Message * message, MessageParser * pars
         
         transaction.commit();
     }
+    return true;
 }
 
 

@@ -23,6 +23,10 @@ struct SmarterMailContactPage {
 
 struct SmarterMailMessageBody {
     std::string mime;
+    // Safe diagnostics for malformed upstream responses: field names, JSON
+    // types, and collection/string sizes only. Never contains message text.
+    std::string responseShape;
+    std::vector<nlohmann::json> attachments;
     bool hasAttachments = false;
     uint32_t replyUid = 0;
     std::string replyFolder;
@@ -39,6 +43,10 @@ public:
     SmarterMailPage messages(const std::string & folder, unsigned int skip, unsigned int take);
     SmarterMailMessageBody messageBody(const std::string & folder, uint32_t uid);
     std::string rawMessage(const std::string & folder, uint32_t uid);
+    std::string attachmentBytes(const nlohmann::json & attachment,
+                                const std::string & folder, uint32_t uid,
+                                size_t index);
+    std::string materializeInlineImageUrls(const std::string & html);
     void sendMessage(const nlohmann::json & payload);
     void uploadComposeAttachment(const std::string & guid, const std::string & filename,
                                  const std::string & contentType, const std::string & bytes);
@@ -89,6 +97,7 @@ private:
     nlohmann::json requestJSON(const std::string & path, const std::string & method = "GET",
                                const nlohmann::json & payload = nullptr);
     std::string requestText(const std::string & path, const nlohmann::json & payload);
+    std::string inlineAttachmentBytes(const std::string & relativeUrl);
     static void requireSuccess(const nlohmann::json & response, const std::string & operation);
 };
 
