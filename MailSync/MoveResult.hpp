@@ -2,11 +2,20 @@
 #include "json.hpp"
 #include <string>
 #include <cstdint>
+#include <ctime>
 #include <set>
 #include <vector>
 #include "SmarterMailHeaders.hpp"
 
 namespace MoveResult {
+// SmarterMail can acknowledge a move before its folder indexes expose the
+// destination UID.  Keep the optimistic move stable during that bounded
+// eventual-consistency window, but eventually trust a source row that never
+// went away so a genuinely failed move is not hidden forever.
+constexpr std::time_t pendingMoveGraceSeconds = 120;
+inline bool sourceMayStillBeStale(std::time_t acceptedAt, std::time_t now) {
+    return acceptedAt > 0 && now >= acceptedAt && now - acceptedAt < pendingMoveGraceSeconds;
+}
 inline uint32_t uid(const nlohmann::json & value) {
     try {
         const std::string s = value.is_string() ? value.get<std::string>() : value.dump();

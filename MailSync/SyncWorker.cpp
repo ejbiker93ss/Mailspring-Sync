@@ -12,6 +12,7 @@
 #include <chrono>
 #include <functional>
 #include <iomanip>
+#include <map>
 #include <set>
 
 #include "SyncWorker.hpp"
@@ -31,6 +32,7 @@
 #include "FolderSyncPolicy.hpp"
 #include "SmarterMailClient.hpp"
 #include "SmarterMailHeaders.hpp"
+#include "MoveResult.hpp"
 
 
 #define CACHE_CLEANUP_INTERVAL      60 * 60
@@ -1071,6 +1073,27 @@ bool SyncWorker::syncSmarterMailMessages()
     time_t startedAt = time(0);
     bool performedFullScan = false;
 
+    // Moves without a returned destination UID remain represented by their
+    // original local message, marked with smPendingMove.  Index the handful of
+    // outstanding moves once per pass so a stale source listing cannot create
+    // a second physical message and make an archived card pop back into Inbox.
+    map<string, shared_ptr<Message>> pendingBySource;
+    map<string, vector<shared_ptr<Message>>> pendingByDestinationMessageId;
+    auto pendingMoves = store->findAll<Message>(Query().equal("accountId", account->id())
+        .equal("remoteUID", (double)(UINT32_MAX - 1)));
+    for (auto & pending : pendingMoves) {
+        if (!pending->_data.count("smPendingMove") || !pending->_data["smPendingMove"].is_object()) continue;
+        const auto & move = pending->_data["smPendingMove"];
+        const string sourceFolder = move.value("sourceFolder", "");
+        const uint32_t sourceUid = move.value("sourceUid", 0u);
+        const string destinationFolder = move.value("destinationFolder", "");
+        const string messageId = SmarterMailHeaders::ids(move.value("messageId", ""));
+        if (!sourceFolder.empty() && sourceUid)
+            pendingBySource[sourceFolder + "\n" + to_string(sourceUid)] = pending;
+        if (!destinationFolder.empty() && !messageId.empty())
+            pendingByDestinationMessageId[destinationFolder + "\n" + messageId].push_back(pending);
+    }
+
     for (auto & folder : folders) {
         string path = folder->path();
         const json status = folder->localStatus();
@@ -1095,9 +1118,56 @@ bool SyncWorker::syncSmarterMailMessages()
                 uint32_t uid = smUID(remote);
                 if (uid == 0) continue;
                 seen.insert(uid);
+
+                shared_ptr<Message> pending;
+                const string sourceKey = path + "\n" + to_string(uid);
+                auto sourceMatch = pendingBySource.find(sourceKey);
+                if (sourceMatch != pendingBySource.end()) {
+                    const auto & move = sourceMatch->second->_data["smPendingMove"];
+                    const time_t acceptedAt = move.value("acceptedAt", (int64_t)0);
+                    if (MoveResult::sourceMayStillBeStale(acceptedAt, startedAt)) {
+                        logger->info("Deferring stale SmarterMail source UID {} in {} while its move settles", uid, path);
+                        continue;
+                    }
+                    // SmarterMail continued to report the source beyond the grace
+                    // period. Restore the one optimistic local row instead of
+                    // inserting a duplicate, and let the user retry the move.
+                    pending = sourceMatch->second;
+                    const string destinationKey = move.value("destinationFolder", "") + "\n" +
+                        SmarterMailHeaders::ids(move.value("messageId", ""));
+                    pending->_data.erase("smPendingMove");
+                    pending->setRemoteFolder(folder.get());
+                    pending->setClientFolder(folder.get());
+                    pending->setRemoteUID(uid);
+                    pending->setSyncedAt(0);
+                    pendingBySource.erase(sourceMatch);
+                    pendingByDestinationMessageId.erase(destinationKey);
+                    store->save(pending.get());
+                }
+
+                if (!pending) {
+                    const string messageId = MoveResult::messageId(remote);
+                    auto destinationMatch = pendingByDestinationMessageId.find(path + "\n" + messageId);
+                    if (!messageId.empty() && destinationMatch != pendingByDestinationMessageId.end() &&
+                        destinationMatch->second.size() == 1) {
+                        pending = destinationMatch->second.front();
+                        const auto move = pending->_data["smPendingMove"];
+                        pending->_data.erase("smPendingMove");
+                        pending->setRemoteFolder(folder.get());
+                        pending->setClientFolder(folder.get());
+                        pending->setRemoteUID(uid);
+                        pending->setSyncedAt(0);
+                        pendingBySource.erase(move.value("sourceFolder", "") + "\n" +
+                            to_string(move.value("sourceUid", 0u)));
+                        pendingByDestinationMessageId.erase(destinationMatch);
+                        store->save(pending.get());
+                        logger->info("Reconciled SmarterMail move to UID {} in {}", uid, path);
+                    }
+                }
+
                 IMAPMessage * value = smMessage(remote, path);
                 // Header enrichment must not change an existing local identity.
-                auto local = store->find<Message>(Query().equal("accountId", account->id())
+                auto local = pending ? pending : store->find<Message>(Query().equal("accountId", account->id())
                     .equal("remoteFolderId", folder->id()).equal("remoteUID", (double)uid));
                 if (local) processor->updateMessage(local.get(), value, *folder, startedAt);
                 else local = processor->insertFallbackToUpdateMessage(value, *folder, startedAt);

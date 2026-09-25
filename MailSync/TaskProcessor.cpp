@@ -135,63 +135,69 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
     for (unsigned int i = 0; i < remaining->count(); ++i) {
         remainingUIDs.insert(((IMAPMessage *)remaining->objectAtIndex(i))->uid());
     }
-    bool missingMapping = false;
+    vector<shared_ptr<Message>> unresolved;
 
-    // Only returned if UIDPLUS extension is present and the server tells us
-    // which UIDs in the old folder map to which UIDs in the new folder.
-    if (uidmap != nullptr) {
-        for (auto msg : messages) {
-            if (remainingUIDs.count(msg->remoteUID())) continue;
+    // UIDPLUS servers are allowed to return a UID map, but some servers return
+    // an empty or partial map even though MOVE completed. Apply every mapping
+    // we can prove and send only the missing entries through the bounded
+    // destination lookup below.
+    for (auto msg : messages) {
+        if (remainingUIDs.count(msg->remoteUID())) continue;
+        Value * newUID = nullptr;
+        if (uidmap != nullptr) {
             Value * currentUID = Value::valueWithUnsignedLongValue(msg->remoteUID());
-            Value * newUID = (Value *)uidmap->objectForKey(currentUID);
-            if (!newUID) {
-                missingMapping = true;
-                continue;
-            }
+            newUID = (Value *)uidmap->objectForKey(currentUID);
+        }
+        if (newUID && newUID->unsignedIntValue()) {
             msg->setRemoteFolder(destFolder);
             msg->setRemoteUID(newUID->unsignedIntValue());
+        } else {
+            unresolved.push_back(msg);
         }
-    } else {
-        // UIDPLUS is not supported, we need to manually find the messages. Thankfully moves
-        // should add higher UIDs to the folder so we can grab the last few and get the messages
+    }
+
+    if (!unresolved.empty()) {
+        // Fetch headers from only the newest destination UID window. This is a
+        // constant-sized recovery request, not a scan of a potentially massive
+        // Archive folder. A wider floor tolerates UID gaps and a little
+        // concurrent delivery while remaining respectful of the server.
         auto status = session->folderStatus(destPath, &err);
         if (err != ErrorNone) throw SyncException(err, "moveMessages(destination status)");
         if (!status) throw SyncException("move-unconfirmed", "Destination status unavailable", false);
         IMAPMessagesRequestKind kind = MailUtils::messagesRequestKindFor(session->storedCapabilities(), true);
-        
-        if (status != nullptr) {
-            // Calculate a safe lower bound to avoid underflow with unsigned arithmetic.
-            // We search from (uidNext - messages.size() * 2) to find the moved messages,
-            // using a multiplier of 2 to account for potential gaps in UID assignment.
-            uint32_t uidNext = status->uidNext();
-            uint32_t searchRange = (uint32_t)messages.size() * 2;
-            uint32_t min = (uidNext > searchRange) ? (uidNext - searchRange) : 1;
-            if (uidNext <= min) throw SyncException("move-unconfirmed", "Destination UID window unavailable", false);
-            IndexSet * set = IndexSet::indexSetWithRange(RangeMake(min, uidNext - min));
-            Array * movedMessages = session->fetchMessagesByUID(destPath, kind, set, nullptr, &err);
-            if (err != ErrorNone) throw SyncException(err, "moveMessages(destination lookup)");
-            if (!movedMessages) throw SyncException("move-unconfirmed", "Destination lookup unavailable", false);
-            for (auto msg : messages) {
-                if (remainingUIDs.count(msg->remoteUID())) continue;
-                bool found = false;
-                for (unsigned int ii = 0; ii < movedMessages->count(); ii ++) {
-                    IMAPMessage * movedMessage = (IMAPMessage*)movedMessages->objectAtIndex(ii);
-                    string movedId = MailUtils::idForMessage(msg->accountId(), destFolder->path(), movedMessage);
-                    if (msg->id() == movedId || msg->_data.value("physicalBaseId", string()) == movedId) {
-                        msg->setRemoteFolder(destFolder);
-                        msg->setRemoteUID(movedMessage->uid());
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    missingMapping = true;
+        uint32_t uidNext = status->uidNext();
+        uint32_t searchRange = max<uint32_t>(20, min<uint32_t>(500, (uint32_t)unresolved.size() * 4));
+        uint32_t minUID = (uidNext > searchRange) ? (uidNext - searchRange) : 1;
+        if (uidNext <= minUID) throw SyncException("move-unconfirmed", "Destination UID window unavailable", false);
+        IndexSet * set = IndexSet::indexSetWithRange(RangeMake(minUID, uidNext - minUID));
+        Array * movedMessages = session->fetchMessagesByUID(destPath, kind, set, nullptr, &err);
+        if (err != ErrorNone) throw SyncException(err, "moveMessages(destination lookup)");
+        if (!movedMessages) throw SyncException("move-unconfirmed", "Destination lookup unavailable", false);
+
+        vector<shared_ptr<Message>> stillUnresolved;
+        std::set<uint32_t> claimed;
+        for (auto msg : unresolved) {
+            bool found = false;
+            for (unsigned int ii = 0; ii < movedMessages->count(); ii ++) {
+                IMAPMessage * movedMessage = (IMAPMessage*)movedMessages->objectAtIndex(ii);
+                if (claimed.count(movedMessage->uid())) continue;
+                string movedId = MailUtils::idForMessage(msg->accountId(), destFolder->path(), movedMessage);
+                if (msg->id() == movedId || msg->_data.value("physicalBaseId", string()) == movedId) {
+                    msg->setRemoteFolder(destFolder);
+                    msg->setRemoteUID(movedMessage->uid());
+                    claimed.insert(movedMessage->uid());
+                    found = true;
+                    break;
                 }
             }
+            if (!found) stillUnresolved.push_back(msg);
         }
+        spdlog::get("logger")->info("Recovered {} of {} incomplete IMAP MOVE UID mapping(s) from a {}-UID destination window",
+            unresolved.size() - stillUnresolved.size(), unresolved.size(), searchRange);
+        unresolved = stillUnresolved;
     }
     
-    if (!remainingUIDs.empty() || missingMapping) {
+    if (!remainingUIDs.empty() || !unresolved.empty()) {
         throw SyncException("move-incomplete", "Some messages could not be confirmed in the destination. Check both folders before retrying.", false);
     }
     if (mustApplyAttributes) {
@@ -1025,6 +1031,13 @@ void TaskProcessor::performRemoteSmarterMailChange(Task * task) {
                 if (destination->role() == "trash") {
                     client.remove(entry.first, uids, true);
                     for (auto & msg : batch) {
+                        msg->_data["smPendingMove"] = {
+                            {"sourceFolder", entry.first},
+                            {"sourceUid", msg->remoteUID()},
+                            {"destinationFolder", destination->path()},
+                            {"acceptedAt", (int64_t)time(0)},
+                            {"messageId", SmarterMailHeaders::ids(msg->headerMessageId())}
+                        };
                         msg->setRemoteFolder(destination.get());
                         msg->setRemoteUID(UINT32_MAX - 1);
                     }
@@ -1038,15 +1051,24 @@ void TaskProcessor::performRemoteSmarterMailChange(Task * task) {
                 size_t awaitingReconciliation = 0;
                 for (auto & msg : batch) {
                     uint32_t uid = MoveResult::mapped(response, msg->remoteUID());
+                    const uint32_t sourceUid = msg->remoteUID();
                     msg->setRemoteFolder(destination.get());
                     if (uid && assigned.insert(uid).second) {
                         msg->setRemoteUID(uid);
+                        msg->_data.erase("smPendingMove");
                     } else {
                         // A successful SmarterMail move commonly omits the new UID.
                         // Do not scan a potentially huge destination folder or report
                         // a false failure. The sentinel prevents later mutations from
                         // targeting the stale source UID while normal bounded folder
                         // synchronization discovers the authoritative destination row.
+                        msg->_data["smPendingMove"] = {
+                            {"sourceFolder", entry.first},
+                            {"sourceUid", sourceUid},
+                            {"destinationFolder", destination->path()},
+                            {"acceptedAt", (int64_t)time(0)},
+                            {"messageId", SmarterMailHeaders::ids(msg->headerMessageId())}
+                        };
                         msg->setRemoteUID(UINT32_MAX - 1);
                         awaitingReconciliation++;
                     }

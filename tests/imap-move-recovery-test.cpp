@@ -100,6 +100,9 @@ int main(int argc, char ** argv) {
     assert(MoveResult::newlyObserved(rows, {}, "test@example.invalid") == 101);
     assert(MoveResult::newlyObserved(rows, {101}, "test@example.invalid") == 0);
     assert(MoveResult::newlyObserved(rows, {}, "different@example.invalid") == 0);
+    assert(MoveResult::sourceMayStillBeStale(100, 219));
+    assert(!MoveResult::sourceMayStillBeStale(100, 220));
+    assert(!MoveResult::sourceMayStillBeStale(0, 100));
     std::cout << "PASS: archive preserves Sent copies; Sent-only archive is a no-op; explicit moves remain supported\n";
     std::cout << "PASS: thread snapshot survives repair; late replies stay; confirmed progress survives; failures and unresolved API IDs restore; safe UID mapping\n";
 }
