@@ -52,15 +52,25 @@ int main(int argc, char ** argv) {
     a = store.find<Message>(Query().equal("id", a->id()));
     a->setThreadId("repaired-thread"); store.save(a.get());
     tasks.performRemote(&task);
-    assert(!task.toJSON()["error"].is_null());
+    const std::string mode = argv[2];
     const auto error = task.toJSON()["error"];
-    if (std::string(argv[2]) == "noop") assert(error["key"] == "move-incomplete");
-    if (std::string(argv[2]) == "copy") assert(error["debuginfo"] == "moveMessages(mark deleted after copy)");
+    if (mode == "stale") {
+        assert(error.is_null());
+    } else {
+        assert(!error.is_null());
+        if (mode == "noop") assert(error["key"] == "move-incomplete");
+        if (mode == "copy") assert(error["debuginfo"] == "moveMessages(mark deleted after copy)");
+    }
     a = store.find<Message>(Query().equal("id", a->id()));
     b = store.find<Message>(Query().equal("id", b->id()));
     assert(a->syncUnsavedChanges() == 0 && b->syncUnsavedChanges() == 0);
-    assert(b->clientFolderId() == second.id() && b->remoteUID() == 2);
-    assert(b->syncedAt() == 0);
+    if (mode == "stale") {
+        assert(a->clientFolderId() == dest.id() && a->remoteUID() == 101);
+        assert(b->clientFolderId() == dest.id() && b->remoteUID() == 142);
+    } else {
+        assert(b->clientFolderId() == second.id() && b->remoteUID() == 2);
+        assert(b->syncedAt() == 0);
+    }
     late = store.find<Message>(Query().equal("id", late->id()));
     assert(late->remoteUID() == 3 && late->clientFolderId() == first.id());
     assert(late->syncUnsavedChanges() == 0);
@@ -75,7 +85,7 @@ int main(int argc, char ** argv) {
     tasks.performLocal(&explicitMove);
     reply = store.find<Message>(Query().equal("id", reply->id()));
     assert(reply->clientFolderId() == dest.id()); // Move-to-folder remains explicit.
-    if (std::string(argv[2]) == "partial") {
+    if (mode == "partial" || mode == "stale") {
         assert(a->remoteUID() == 101 && a->remoteFolderId() == dest.id());
         assert(a->clientFolderId() == dest.id());
     } else {
@@ -105,4 +115,5 @@ int main(int argc, char ** argv) {
     assert(!MoveResult::sourceMayStillBeStale(0, 100));
     std::cout << "PASS: archive preserves Sent copies; Sent-only archive is a no-op; explicit moves remain supported\n";
     std::cout << "PASS: thread snapshot survives repair; late replies stay; confirmed progress survives; failures and unresolved API IDs restore; safe UID mapping\n";
+    if (mode == "stale") std::cout << "PASS: stale IMAP UID is recovered by targeted Message-ID search and retried once\n";
 }

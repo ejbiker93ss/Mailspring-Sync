@@ -32,6 +32,7 @@
 #include "ReplyHeaders.hpp"
 #include "SmarterMailCompose.hpp"
 #include "MoveResult.hpp"
+#include <MailCore/MCIMAPSearchExpression.h>
 
 #include <sstream>
 #include <algorithm>
@@ -95,7 +96,21 @@ static void setFileModificationTime(const string & filepath, time_t timestamp) {
 // A helper function that can move messages between folders and update the provided
 // messages remoteUIDs, even if UIDPLUS and/or MOVE extensions are not present.
 
-void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destFolder, IndexSet * uids, vector<shared_ptr<Message>> messages) {
+static uint32_t _uniqueUIDForMessageId(IMAPSession * session, String * path,
+                                       const string & messageId, ErrorCode * error) {
+    *error = ErrorCode::ErrorNone;
+    if (messageId.empty()) return 0;
+    IMAPSearchExpression * expression = IMAPSearchExpression::searchHeader(
+        MCSTR("Message-ID"), AS_MCSTR(messageId));
+    IndexSet * matches = session->search(path, expression, error);
+    if (*error != ErrorCode::ErrorNone || !matches || matches->count() != 1 || matches->rangesCount() != 1) return 0;
+    const uint64_t uid = matches->allRanges()[0].location;
+    return uid > 0 && uid <= UINT32_MAX ? (uint32_t)uid : 0;
+}
+
+void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destFolder,
+                            IndexSet * uids, vector<shared_ptr<Message>> messages,
+                            bool allowStaleUIDRecovery = true) {
     ErrorCode err = ErrorCode::ErrorNone;
     HashMap * uidmap = nullptr;
     String * destPath = AS_MCSTR(destFolder->path());
@@ -156,6 +171,62 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
         }
     }
 
+    set<string> sourceStillPresent;
+    // A successful IMAP command against a stale/nonexistent UID is a legal
+    // no-op on several servers. Before accepting any pre-existing destination
+    // copy, ask the source server for the message's current UID by stable
+    // Message-ID and retry once. This is one targeted UID-only SEARCH per
+    // unresolved message and never downloads the Inbox.
+    if (allowStaleUIDRecovery && !unresolved.empty()) {
+        vector<shared_ptr<Message>> retryMessages;
+        vector<shared_ptr<Message>> notRetried;
+        IndexSet * retryUIDs = IndexSet::indexSet();
+        for (auto msg : unresolved) {
+            ErrorCode searchError = ErrorCode::ErrorNone;
+            const uint32_t currentUID = _uniqueUIDForMessageId(
+                session, path, msg->headerMessageId(), &searchError);
+            if (currentUID && currentUID != msg->remoteUID()) {
+                spdlog::get("logger")->info(
+                    "Resolved stale IMAP source UID {} to {} in {}; retrying MOVE once",
+                    msg->remoteUID(), currentUID, path->UTF8Characters());
+                msg->setRemoteUID(currentUID);
+                retryUIDs->addIndex(currentUID);
+                retryMessages.push_back(msg);
+            } else {
+                if (currentUID) sourceStillPresent.insert(msg->id());
+                notRetried.push_back(msg);
+            }
+        }
+        if (!retryMessages.empty()) {
+            _moveMessagesResilient(session, path, destFolder, retryUIDs, retryMessages, false);
+        }
+        unresolved = notRetried;
+    }
+
+    if (!unresolved.empty()) {
+        // Prefer a server-side Message-ID lookup. It returns only UIDs and is
+        // both more precise and cheaper than downloading a wide Archive page.
+        // Fall back to the recent header window for servers that do not index
+        // Message-ID or when duplicate IDs make the result ambiguous.
+        vector<shared_ptr<Message>> needsWindow;
+        for (auto msg : unresolved) {
+            if (sourceStillPresent.count(msg->id())) {
+                needsWindow.push_back(msg);
+                continue;
+            }
+            ErrorCode searchError = ErrorCode::ErrorNone;
+            const uint32_t uid = _uniqueUIDForMessageId(
+                session, destPath, msg->headerMessageId(), &searchError);
+            if (uid) {
+                msg->setRemoteFolder(destFolder);
+                msg->setRemoteUID(uid);
+            } else {
+                needsWindow.push_back(msg);
+            }
+        }
+        unresolved = needsWindow;
+    }
+
     if (!unresolved.empty()) {
         // Fetch headers from only the newest destination UID window. This is a
         // constant-sized recovery request, not a scan of a potentially massive
@@ -177,12 +248,19 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
         vector<shared_ptr<Message>> stillUnresolved;
         std::set<uint32_t> claimed;
         for (auto msg : unresolved) {
+            if (sourceStillPresent.count(msg->id())) {
+                stillUnresolved.push_back(msg);
+                continue;
+            }
             bool found = false;
             for (unsigned int ii = 0; ii < movedMessages->count(); ii ++) {
                 IMAPMessage * movedMessage = (IMAPMessage*)movedMessages->objectAtIndex(ii);
                 if (claimed.count(movedMessage->uid())) continue;
                 string movedId = MailUtils::idForMessage(msg->accountId(), destFolder->path(), movedMessage);
-                if (msg->id() == movedId || msg->_data.value("physicalBaseId", string()) == movedId) {
+                String * candidateMessageId = movedMessage->header()->messageID();
+                const bool sameHeaderId = candidateMessageId && !msg->headerMessageId().empty() &&
+                    msg->headerMessageId() == candidateMessageId->UTF8Characters();
+                if (sameHeaderId || msg->id() == movedId || msg->_data.value("physicalBaseId", string()) == movedId) {
                     msg->setRemoteFolder(destFolder);
                     msg->setRemoteUID(movedMessage->uid());
                     claimed.insert(movedMessage->uid());
@@ -196,7 +274,7 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
             unresolved.size() - stillUnresolved.size(), unresolved.size(), searchRange);
         unresolved = stillUnresolved;
     }
-    
+
     if (!remainingUIDs.empty() || !unresolved.empty()) {
         throw SyncException("move-incomplete", "Some messages could not be confirmed in the destination. Check both folders before retrying.", false);
     }
