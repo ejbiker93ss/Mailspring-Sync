@@ -8,6 +8,7 @@
 
 int main(int argc, char ** argv) {
     assert(argc == 3);
+    const std::string mode = argv[2];
     spdlog::stdout_logger_mt("logger");
     SetThreadName("test");
     AutoreleasePool pool;
@@ -29,6 +30,11 @@ int main(int argc, char ** argv) {
         return processor.insertMessage(remote, folder, time(0));
     };
     auto a = insert(first, 1), b = insert(second, 2);
+    if (mode == "stale-no-mid") {
+        b->_data["hMsgId"] = "no-header-message-id";
+        b->_data["headerMessageIdGenerated"] = true;
+        store.save(b.get());
+    }
     Folder sent("sent", account->id(), 0);
     sent.setPath("Custom Sent Folder"); sent.setRole("sent"); store.save(&sent);
     auto reply = insert(sent, 4);
@@ -52,9 +58,8 @@ int main(int argc, char ** argv) {
     a = store.find<Message>(Query().equal("id", a->id()));
     a->setThreadId("repaired-thread"); store.save(a.get());
     tasks.performRemote(&task);
-    const std::string mode = argv[2];
     const auto error = task.toJSON()["error"];
-    if (mode == "stale") {
+    if (mode == "stale" || mode == "stale-no-mid") {
         assert(error.is_null());
     } else {
         assert(!error.is_null());
@@ -64,7 +69,7 @@ int main(int argc, char ** argv) {
     a = store.find<Message>(Query().equal("id", a->id()));
     b = store.find<Message>(Query().equal("id", b->id()));
     assert(a->syncUnsavedChanges() == 0 && b->syncUnsavedChanges() == 0);
-    if (mode == "stale") {
+    if (mode == "stale" || mode == "stale-no-mid") {
         assert(a->clientFolderId() == dest.id() && a->remoteUID() == 101);
         assert(b->clientFolderId() == dest.id() && b->remoteUID() == 142);
     } else {
@@ -85,7 +90,7 @@ int main(int argc, char ** argv) {
     tasks.performLocal(&explicitMove);
     reply = store.find<Message>(Query().equal("id", reply->id()));
     assert(reply->clientFolderId() == dest.id()); // Move-to-folder remains explicit.
-    if (mode == "partial" || mode == "stale") {
+    if (mode == "partial" || mode == "stale" || mode == "stale-no-mid") {
         assert(a->remoteUID() == 101 && a->remoteFolderId() == dest.id());
         assert(a->clientFolderId() == dest.id());
     } else {
@@ -116,4 +121,5 @@ int main(int argc, char ** argv) {
     std::cout << "PASS: archive preserves Sent copies; Sent-only archive is a no-op; explicit moves remain supported\n";
     std::cout << "PASS: thread snapshot survives repair; late replies stay; confirmed progress survives; failures and unresolved API IDs restore; safe UID mapping\n";
     if (mode == "stale") std::cout << "PASS: stale IMAP UID is recovered by targeted Message-ID search and retried once\n";
+    if (mode == "stale-no-mid") std::cout << "PASS: stale IMAP UID without Message-ID is recovered by one unique fallback identity search\n";
 }

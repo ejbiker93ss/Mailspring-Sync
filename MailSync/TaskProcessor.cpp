@@ -96,16 +96,60 @@ static void setFileModificationTime(const string & filepath, time_t timestamp) {
 // A helper function that can move messages between folders and update the provided
 // messages remoteUIDs, even if UIDPLUS and/or MOVE extensions are not present.
 
-static uint32_t _uniqueUIDForMessageId(IMAPSession * session, String * path,
-                                       const string & messageId, ErrorCode * error) {
+static uint32_t _uniqueUIDForSearch(IMAPSession * session, String * path,
+                                    IMAPSearchExpression * expression,
+                                    ErrorCode * error, unsigned int * matchCount) {
     *error = ErrorCode::ErrorNone;
-    if (messageId.empty()) return 0;
-    IMAPSearchExpression * expression = IMAPSearchExpression::searchHeader(
-        MCSTR("Message-ID"), AS_MCSTR(messageId));
+    *matchCount = 0;
+    if (!expression) return 0;
     IndexSet * matches = session->search(path, expression, error);
-    if (*error != ErrorCode::ErrorNone || !matches || matches->count() != 1 || matches->rangesCount() != 1) return 0;
+    if (*error != ErrorCode::ErrorNone || !matches) return 0;
+    *matchCount = matches->count();
+    if (*matchCount != 1 || matches->rangesCount() != 1) return 0;
     const uint64_t uid = matches->allRanges()[0].location;
     return uid > 0 && uid <= UINT32_MAX ? (uint32_t)uid : 0;
+}
+
+static uint32_t _uniqueUIDForMessage(IMAPSession * session, String * path,
+                                     const shared_ptr<Message> & message,
+                                     ErrorCode * error) {
+    unsigned int matchCount = 0;
+    const string messageId = message->headerMessageId();
+    if (!messageId.empty() && messageId != "no-header-message-id") {
+        IMAPSearchExpression * byMessageId = IMAPSearchExpression::searchHeader(
+            MCSTR("Message-ID"), AS_MCSTR(messageId));
+        const uint32_t uid = _uniqueUIDForSearch(
+            session, path, byMessageId, error, &matchCount);
+        spdlog::get("logger")->info(
+            "Targeted IMAP move Message-ID search in {} matched {} UID(s){}",
+            path->UTF8Characters(), matchCount,
+            uid ? string("; unique UID ") + to_string(uid) : string());
+        if (*error != ErrorCode::ErrorNone || uid) return uid;
+    }
+
+    // A minority of valid messages have no Message-ID (or reuse one). Fall
+    // back to a narrow server-side identity query rather than scanning the
+    // folder: Subject + sender + the RFC Date day. Accept exactly one UID.
+    const string subject = message->subject();
+    string fromEmail;
+    if (message->from().is_array() && !message->from().empty() &&
+        message->from()[0].is_object() && message->from()[0].count("email") &&
+        message->from()[0]["email"].is_string()) {
+        fromEmail = message->from()[0]["email"].get<string>();
+    }
+    if (subject.empty() || fromEmail.empty() || message->date() <= 0) return 0;
+
+    IMAPSearchExpression * byFallbackIdentity = IMAPSearchExpression::searchAnd(
+        IMAPSearchExpression::searchSubject(AS_MCSTR(subject)),
+        IMAPSearchExpression::searchAnd(
+            IMAPSearchExpression::searchFrom(AS_MCSTR(fromEmail)),
+            IMAPSearchExpression::searchOnDate(message->date())));
+    const uint32_t uid = _uniqueUIDForSearch(
+        session, path, byFallbackIdentity, error, &matchCount);
+    spdlog::get("logger")->info(
+        "Targeted IMAP move fallback identity search in {} matched {} UID(s)",
+        path->UTF8Characters(), matchCount);
+    return uid;
 }
 
 void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destFolder,
@@ -183,8 +227,8 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
         IndexSet * retryUIDs = IndexSet::indexSet();
         for (auto msg : unresolved) {
             ErrorCode searchError = ErrorCode::ErrorNone;
-            const uint32_t currentUID = _uniqueUIDForMessageId(
-                session, path, msg->headerMessageId(), &searchError);
+            const uint32_t currentUID = _uniqueUIDForMessage(
+                session, path, msg, &searchError);
             if (currentUID && currentUID != msg->remoteUID()) {
                 spdlog::get("logger")->info(
                     "Resolved stale IMAP source UID {} to {} in {}; retrying MOVE once",
@@ -215,8 +259,8 @@ void _moveMessagesResilient(IMAPSession * session, String * path, Folder * destF
                 continue;
             }
             ErrorCode searchError = ErrorCode::ErrorNone;
-            const uint32_t uid = _uniqueUIDForMessageId(
-                session, destPath, msg->headerMessageId(), &searchError);
+            const uint32_t uid = _uniqueUIDForMessage(
+                session, destPath, msg, &searchError);
             if (uid) {
                 msg->setRemoteFolder(destFolder);
                 msg->setRemoteUID(uid);
