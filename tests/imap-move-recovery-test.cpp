@@ -41,11 +41,14 @@ int main(int argc, char ** argv) {
     reply->setThreadId(a->threadId()); store.save(reply.get());
     Folder drafts("drafts", account->id(), 0);
     drafts.setPath("Drafts"); drafts.setRole("drafts"); store.save(&drafts);
-    auto draft = insert(drafts, 5);
-    draft->setThreadId(a->threadId()); draft->setDraft(true); store.save(draft.get());
-    // A historical draft row can retain its Drafts location after losing its flag.
-    auto staleDraft = insert(drafts, 6);
-    staleDraft->setThreadId(a->threadId()); staleDraft->setDraft(false); store.save(staleDraft.get());
+    // Reproduce the real failed thread: a hidden, non-draft deletion placeholder
+    // retains Drafts coordinates and UID zero after its visible draft is gone.
+    auto deleted = Message::messageWithDeletionPlaceholderFor(reply);
+    deleted->setRemoteFolder(&drafts); deleted->setClientFolder(&dest);
+    deleted->setRemoteUID(0); store.save(deleted.get());
+    auto pendingDeletion = Message::messageWithDeletionPlaceholderFor(reply);
+    pendingDeletion->setRemoteFolder(&drafts); pendingDeletion->setClientFolder(&drafts);
+    pendingDeletion->setRemoteUID(5); store.save(pendingDeletion.get());
     IMAPSession session;
     session.setHostname(MCSTR("127.0.0.1")); session.setPort(atoi(argv[1]));
     session.setUsername(MCSTR("test")); session.setPassword(MCSTR("test"));
@@ -91,12 +94,23 @@ int main(int argc, char ** argv) {
     reply = store.find<Message>(Query().equal("id", reply->id()));
     assert(reply->clientFolderId() == sent.id() && reply->remoteFolderId() == sent.id());
     assert(reply->remoteUID() == 4 && reply->syncUnsavedChanges() == 0);
-    for (auto original : {draft, staleDraft}) {
+    for (auto original : {deleted, pendingDeletion}) {
         auto saved = store.find<Message>(Query().equal("id", original->id()));
-        assert(saved->clientFolderId() == drafts.id() && saved->remoteFolderId() == drafts.id());
-        assert(saved->syncUnsavedChanges() == 0);
+        assert(saved->toJSON() == original->toJSON());
+    }
+    // Even direct IDs or a persisted task snapshot must not act on placeholders.
+    for (const auto & key : {"messageIds", "resolvedMessageIds"}) {
+        Task hiddenOnly("ChangeFolderTask", account->id(), {{key, {deleted->id(), pendingDeletion->id()}}, {"folder", dest.toJSON()}});
+        tasks.performLocal(&hiddenOnly); tasks.performRemote(&hiddenOnly);
+        assert(hiddenOnly.data()["resolvedMessageIds"].empty());
+        assert(hiddenOnly.toJSON()["error"].is_null());
     }
     Task onlySent("ChangeFolderTask", account->id(), {{"messageIds", {reply->id()}}, {"folder", dest.toJSON()}, {"preserveSent", true}});
+    Task cleanup("DestroyDraftTask", account->id(), {{"stubIds", {deleted->id()}}});
+    tasks.performRemote(&cleanup);
+    assert(cleanup.toJSON()["error"].is_null());
+    assert(!store.find<Message>(Query().equal("id", deleted->id())));
+    assert(store.find<Message>(Query().equal("id", pendingDeletion->id())));
     tasks.performLocal(&onlySent); tasks.performRemote(&onlySent);
     assert(onlySent.data()["resolvedMessageIds"].empty());
     assert(onlySent.toJSON()["error"].is_null());
@@ -133,7 +147,8 @@ int main(int argc, char ** argv) {
     assert(!MoveResult::sourceMayStillBeStale(100, 220));
     assert(!MoveResult::sourceMayStillBeStale(0, 100));
     std::cout << "PASS: archive preserves Sent copies; Sent-only archive is a no-op; explicit moves remain supported\n";
-    std::cout << "PASS: archive excludes drafts, including stale rows without the draft flag\n";
+    std::cout << "PASS: hidden deletion placeholders are excluded from thread moves, direct moves and persisted snapshots; cleanup metadata is unchanged\n";
+    std::cout << "PASS: unsynced IMAP draft cleanup removes its local placeholder without a server request\n";
     if (mode == "noop") std::cout << "PASS: an unconfirmed first folder does not block moving the next folder\n";
     std::cout << "PASS: thread snapshot survives repair; late replies stay; confirmed progress survives; failures and unresolved API IDs restore; safe UID mapping\n";
     if (mode == "stale") std::cout << "PASS: stale IMAP UID is recovered by targeted Message-ID search and retried once\n";

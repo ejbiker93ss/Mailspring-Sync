@@ -911,7 +911,9 @@ ChangeMailModels TaskProcessor::inflateMessages(json & data) {
     }
     
     models.messages.erase(remove_if(models.messages.begin(), models.messages.end(), [&](const shared_ptr<Message> & msg) {
-        return msg->accountId() != account->id();
+        // Deletion placeholders retain old server coordinates for draft cleanup.
+        // They are invisible bookkeeping rows, not members of a user operation.
+        return msg->accountId() != account->id() || msg->isDeletionPlaceholder();
     }), models.messages.end());
     return models;
 }
@@ -925,14 +927,11 @@ void TaskProcessor::performLocalChangeOnMessages(Task * task, void (*modifyLocal
     if (task->constructorName() == "ChangeFolderTask" && data.value("preserveSent", false)) {
         // Archive is not an explicit move: retain physical Sent copies, regardless
         // of sender aliases or localized/custom Sent-folder names.
-        set<string> preservedFolders;
-        for (const auto & folder : store->findAll<Folder>(Query().equal("accountId", account->id()))) {
-            if (folder->role() == "sent" || folder->role() == "drafts")
-                preservedFolders.insert(folder->id());
-        }
+        set<string> sentFolders;
+        for (const auto & folder : store->findAll<Folder>(Query().equal("accountId", account->id()).equal("role", "sent")))
+            sentFolders.insert(folder->id());
         models.messages.erase(remove_if(models.messages.begin(), models.messages.end(), [&](const shared_ptr<Message> & msg) {
-            return msg->isDraft() || preservedFolders.count(msg->clientFolderId()) ||
-                preservedFolders.count(msg->remoteFolderId());
+            return sentFolders.count(msg->clientFolderId()) || sentFolders.count(msg->remoteFolderId());
         }), models.messages.end());
     }
     // Persist exactly the messages whose optimistic changes/locks we own. Thread
@@ -1319,6 +1318,11 @@ void TaskProcessor::performRemoteDestroyDraft(Task * task) {
 
     for (auto & stub : stubs) {
         if (stub->remoteUID() == 0) {
+            // An IMAP draft that never reached the server needs no remote delete.
+            // Finish its local cleanup instead of leaving an invisible row forever.
+            if (!account->usesSmarterMailAPI() && !account->usesMicrosoftGraph()) {
+                store->remove(stub.get());
+            }
             continue; // not synced to server at all
         }
         if (account->usesSmarterMailAPI()) {
