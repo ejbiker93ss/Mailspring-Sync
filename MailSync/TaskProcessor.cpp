@@ -925,11 +925,14 @@ void TaskProcessor::performLocalChangeOnMessages(Task * task, void (*modifyLocal
     if (task->constructorName() == "ChangeFolderTask" && data.value("preserveSent", false)) {
         // Archive is not an explicit move: retain physical Sent copies, regardless
         // of sender aliases or localized/custom Sent-folder names.
-        set<string> sentFolders;
-        for (const auto & folder : store->findAll<Folder>(Query().equal("accountId", account->id()).equal("role", "sent")))
-            sentFolders.insert(folder->id());
+        set<string> preservedFolders;
+        for (const auto & folder : store->findAll<Folder>(Query().equal("accountId", account->id()))) {
+            if (folder->role() == "sent" || folder->role() == "drafts")
+                preservedFolders.insert(folder->id());
+        }
         models.messages.erase(remove_if(models.messages.begin(), models.messages.end(), [&](const shared_ptr<Message> & msg) {
-            return sentFolders.count(msg->clientFolderId()) || sentFolders.count(msg->remoteFolderId());
+            return msg->isDraft() || preservedFolders.count(msg->clientFolderId()) ||
+                preservedFolders.count(msg->remoteFolderId());
         }), models.messages.end());
     }
     // Persist exactly the messages whose optimistic changes/locks we own. Thread
@@ -1031,6 +1034,7 @@ void TaskProcessor::performRemoteChangeOnMessages(Task * task, bool updatesFolde
     }
     
     set<string> completed;
+    shared_ptr<SyncException> batchFailure;
     auto persistBatch = [&](const vector<shared_ptr<Message>> & batch, bool failed) {
         settleMessageChanges(batch, updatesFolder, failed);
     };
@@ -1040,8 +1044,19 @@ void TaskProcessor::performRemoteChangeOnMessages(Task * task, bool updatesFolde
             for (auto batch : MailUtils::chunksOfVector(pair.second, 100)) {
                 IndexSet * uids = IndexSet::indexSet();
                 for (auto msg : batch) uids->addIndex(msg->remoteUID());
-                if (!updatesFolder || pair.first != data["folder"]["path"].get<string>()) {
-                    applyInFolder(session, AS_MCSTR(pair.first), uids, batch, data);
+                try {
+                    if (!updatesFolder || pair.first != data["folder"]["path"].get<string>()) {
+                        applyInFolder(session, AS_MCSTR(pair.first), uids, batch, data);
+                    }
+                } catch (SyncException & ex) {
+                    // An unconfirmed message in one folder must not prevent the
+                    // other folders in this conversation from being archived.
+                    // Stop immediately for connection/protocol failures.
+                    if (!updatesFolder || (ex.key != "move-incomplete" && ex.key != "move-unconfirmed")) throw;
+                    persistBatch(batch, true);
+                    for (auto msg : batch) completed.insert(msg->id());
+                    if (!batchFailure) batchFailure = make_shared<SyncException>(ex);
+                    continue;
                 }
                 persistBatch(batch, false);
                 for (auto msg : batch) completed.insert(msg->id());
@@ -1055,6 +1070,7 @@ void TaskProcessor::performRemoteChangeOnMessages(Task * task, bool updatesFolde
         persistBatch(pending, true);
         throw;
     }
+    if (batchFailure) throw *batchFailure;
 }
 
 void TaskProcessor::performRemoteMicrosoftGraphChange(Task * task) {

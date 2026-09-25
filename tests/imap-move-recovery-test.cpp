@@ -39,6 +39,13 @@ int main(int argc, char ** argv) {
     sent.setPath("Custom Sent Folder"); sent.setRole("sent"); store.save(&sent);
     auto reply = insert(sent, 4);
     reply->setThreadId(a->threadId()); store.save(reply.get());
+    Folder drafts("drafts", account->id(), 0);
+    drafts.setPath("Drafts"); drafts.setRole("drafts"); store.save(&drafts);
+    auto draft = insert(drafts, 5);
+    draft->setThreadId(a->threadId()); draft->setDraft(true); store.save(draft.get());
+    // A historical draft row can retain its Drafts location after losing its flag.
+    auto staleDraft = insert(drafts, 6);
+    staleDraft->setThreadId(a->threadId()); staleDraft->setDraft(false); store.save(staleDraft.get());
     IMAPSession session;
     session.setHostname(MCSTR("127.0.0.1")); session.setPort(atoi(argv[1]));
     session.setUsername(MCSTR("test")); session.setPassword(MCSTR("test"));
@@ -72,6 +79,8 @@ int main(int argc, char ** argv) {
     if (mode == "stale" || mode == "stale-no-mid") {
         assert(a->clientFolderId() == dest.id() && a->remoteUID() == 101);
         assert(b->clientFolderId() == dest.id() && b->remoteUID() == 142);
+    } else if (mode == "noop") {
+        assert(b->clientFolderId() == dest.id() && b->remoteUID() == 102);
     } else {
         assert(b->clientFolderId() == second.id() && b->remoteUID() == 2);
         assert(b->syncedAt() == 0);
@@ -82,6 +91,11 @@ int main(int argc, char ** argv) {
     reply = store.find<Message>(Query().equal("id", reply->id()));
     assert(reply->clientFolderId() == sent.id() && reply->remoteFolderId() == sent.id());
     assert(reply->remoteUID() == 4 && reply->syncUnsavedChanges() == 0);
+    for (auto original : {draft, staleDraft}) {
+        auto saved = store.find<Message>(Query().equal("id", original->id()));
+        assert(saved->clientFolderId() == drafts.id() && saved->remoteFolderId() == drafts.id());
+        assert(saved->syncUnsavedChanges() == 0);
+    }
     Task onlySent("ChangeFolderTask", account->id(), {{"messageIds", {reply->id()}}, {"folder", dest.toJSON()}, {"preserveSent", true}});
     tasks.performLocal(&onlySent); tasks.performRemote(&onlySent);
     assert(onlySent.data()["resolvedMessageIds"].empty());
@@ -119,6 +133,8 @@ int main(int argc, char ** argv) {
     assert(!MoveResult::sourceMayStillBeStale(100, 220));
     assert(!MoveResult::sourceMayStillBeStale(0, 100));
     std::cout << "PASS: archive preserves Sent copies; Sent-only archive is a no-op; explicit moves remain supported\n";
+    std::cout << "PASS: archive excludes drafts, including stale rows without the draft flag\n";
+    if (mode == "noop") std::cout << "PASS: an unconfirmed first folder does not block moving the next folder\n";
     std::cout << "PASS: thread snapshot survives repair; late replies stay; confirmed progress survives; failures and unresolved API IDs restore; safe UID mapping\n";
     if (mode == "stale") std::cout << "PASS: stale IMAP UID is recovered by targeted Message-ID search and retried once\n";
     if (mode == "stale-no-mid") std::cout << "PASS: stale IMAP UID without Message-ID is recovered by one unique fallback identity search\n";
