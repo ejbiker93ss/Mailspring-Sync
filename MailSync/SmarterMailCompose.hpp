@@ -1,9 +1,41 @@
 #pragma once
 #include "Message.hpp"
+#include "MailStore.hpp"
 #include "SyncException.hpp"
 #include <random>
 
 namespace SmarterMailCompose {
+inline bool usableParent(Message & draft, Message & parent) {
+    return parent.accountId() == draft.accountId() && parent.remoteUID() != 0 &&
+        parent.remoteUID() <= UINT32_MAX - 5 &&
+        !parent.remoteFolder().value("path", "").empty();
+}
+
+// A moved message can leave a nonphysical local placeholder at the ID saved
+// in a draft. Recover only from a unique physical copy of the same Internet ID
+// in the same account; guessing between duplicates could forward the wrong mail.
+inline std::shared_ptr<Message> resolveParent(MailStore & store, Message & draft) {
+    std::shared_ptr<Message> parent;
+    const auto localParent = draft._data.find("replyToMessageId");
+    if (localParent != draft._data.end() && localParent->is_string()) {
+        parent = store.find<Message>(Query().equal("accountId", draft.accountId())
+            .equal("id", localParent->get<std::string>()));
+    }
+    if (parent && usableParent(draft, *parent)) return parent;
+
+    const std::string mid = draft.forwardedHeaderMessageId().empty()
+        ? draft.replyToHeaderMessageId() : draft.forwardedHeaderMessageId();
+    if (mid.empty()) return nullptr;
+    std::shared_ptr<Message> match;
+    for (auto & candidate : store.findAll<Message>(Query().equal("accountId", draft.accountId())
+        .equal("headerMessageId", mid))) {
+        if (!usableParent(draft, *candidate)) continue;
+        if (match && match->id() != candidate->id()) return nullptr;
+        match = candidate;
+    }
+    return match;
+}
+
 inline std::string guid() {
     std::random_device random;
     const char * hex = "0123456789abcdef";
@@ -41,8 +73,7 @@ inline nlohmann::json payload(Message & draft, const std::string & owner,
         (draft._data.count("replyToMessageId") && draft._data["replyToMessageId"].is_string() &&
          !draft._data["replyToMessageId"].get<std::string>().empty()));
     if (reply || forward) {
-        if (!parent || parent->accountId() != draft.accountId() || !parent->remoteUID() ||
-            parent->remoteUID() > UINT32_MAX - 5 || parent->remoteFolder().value("path", "").empty()) {
+        if (!parent || !usableParent(draft, *parent)) {
             throw SyncException("smartermail-reply-parent-missing", "Cannot locate the original message on SmarterMail. Reopen it and reply again; no email was sent.", false);
         }
         result["replyUid"] = parent->remoteUID();
