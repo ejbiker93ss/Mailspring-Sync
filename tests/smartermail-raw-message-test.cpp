@@ -74,5 +74,27 @@ int main() {
         "--==_mimepart_example--\r\n";
     assert(normalize(validMultipart) == validMultipart);
 
+    const std::string blockedHTML =
+        "<html><img width=\"473\" src=\"https://mail.example.com/interface/img/s.png\"></html>";
+    assert(SmarterMailRawMessage::hasBlockedRemoteImages(blockedHTML));
+    assert(SmarterMailRawMessage::hasBlockedRemoteImages(
+        "<IMG SRC='/interface/img/s.png?x=1'>"));
+    assert(!SmarterMailRawMessage::hasBlockedRemoteImages(
+        "<a href='/interface/img/s.png'>link</a>"));
+    assert(!SmarterMailRawMessage::hasBlockedRemoteImages(
+        "<img src='https://apple.example/logo.png'>"));
+    const std::string originalHTML = "<html><img src='https://apple.example/logo.png'></html>";
+    const std::string originalMIME = SmarterMailRawMessage::structuredBodyMime(originalHTML, "");
+    assert(SmarterMailRawMessage::displayMime(blockedHTML, "Dear Emory", originalMIME) == originalMIME);
+    assert(SmarterMailRawMessage::displayMime(blockedHTML, "Dear Emory", originalHTML) == originalMIME);
+    assert(SmarterMailRawMessage::displayMime(blockedHTML, "Dear Emory", validMultipart) == validMultipart);
+    for (const auto & invalid : {std::string("success"), std::string("--==_mimepart_example--"),
+                                SmarterMailRawMessage::structuredBodyMime(blockedHTML, "")}) {
+        assert(SmarterMailRawMessage::displayMime(blockedHTML, "Dear Emory", invalid) ==
+            SmarterMailRawMessage::structuredBodyMime(blockedHTML, "Dear Emory"));
+    }
+    // Do not replace healthy structured HTML just because raw was supplied.
+    assert(SmarterMailRawMessage::displayMime(originalHTML, "", validMultipart) == originalMIME);
+
     return 0;
 }

@@ -2,6 +2,7 @@
 #define SmarterMailRawMessage_hpp
 
 #include <cctype>
+#include <regex>
 #include <string>
 
 namespace SmarterMailRawMessage {
@@ -223,6 +224,33 @@ inline std::string normalize(const std::string & value) {
            "Content-Type: text/html; charset=utf-8\r\n"
            "Content-Transfer-Encoding: 8bit\r\n"
            "\r\n" + value;
+}
+
+inline bool hasBlockedRemoteImages(const std::string & html) {
+    // SmarterMail's cleansed display HTML replaces remote sources with its
+    // spacer. Those URLs cannot be recovered by the message viewer.
+    static const std::regex placeholder(
+        R"(<img\b[^>]*\bsrc\s*=\s*["'](?:https?://[^/"']+)?/interface/img/s\.png(?:\?[^"']*)?["'])",
+        std::regex::icase);
+    return std::regex_search(html, placeholder);
+}
+
+inline bool isOriginalDisplayMime(const std::string & raw) {
+    if (raw.empty() || isClosingBoundaryOnly(raw) || hasBlockedRemoteImages(raw)) return false;
+    if (isBareHTMLDocument(raw)) return true;
+    const std::string mime = normalize(raw);
+    size_t separatorLength = 0;
+    const size_t separator = headerSeparator(mime, separatorLength);
+    if (separator == std::string::npos) return false;
+    const std::string headers = lowerCopy(mime.substr(0, separator));
+    return headers.find("content-type: text/html") != std::string::npos ||
+           headers.find("content-type: multipart/") != std::string::npos;
+}
+
+inline std::string displayMime(const std::string & html, const std::string & text,
+                               const std::string & raw) {
+    if (hasBlockedRemoteImages(html) && isOriginalDisplayMime(raw)) return normalize(raw);
+    return structuredBodyMime(html, text);
 }
 
 } // namespace SmarterMailRawMessage

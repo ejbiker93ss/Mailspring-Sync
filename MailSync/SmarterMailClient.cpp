@@ -483,14 +483,24 @@ SmarterMailMessageBody SmarterMailClient::messageBody(const string & folder, uin
     string text = bodyValue({"messagePlainText", "textBody", "plainText"});
     if (html.empty()) html = bodyPartValue(true);
     if (text.empty()) text = bodyPartValue(false);
-    result.mime = SmarterMailRawMessage::structuredBodyMime(html, text);
-    if (!result.mime.empty()) result.mime = SmarterMailHeaders::mime(detail) + result.mime;
+    string raw = bodyValue({"raw", "rawContent", "messageRaw", "mimeContent"});
+    // GetMessage also returns original RFC822 at the response root, outside
+    // messageData. Preserve it when the display HTML contains blocked images.
+    if (!SmarterMailRawMessage::isOriginalDisplayMime(raw) && response.is_object() &&
+        response.count("raw") && response["raw"].is_string()) {
+        raw = response["raw"].get<string>();
+    }
+    result.mime = SmarterMailRawMessage::displayMime(html, text, raw);
+    const bool usedOriginal = SmarterMailRawMessage::hasBlockedRemoteImages(html) &&
+        SmarterMailRawMessage::isOriginalDisplayMime(raw);
+    if (!result.mime.empty() && (!usedOriginal || SmarterMailRawMessage::isBareHTMLDocument(raw))) {
+        result.mime = SmarterMailHeaders::mime(detail) + result.mime;
+    }
     if (result.mime.empty()) {
         // `raw` is part of the successful /mail/message response, not the
         // unreliable raw-content compatibility endpoint.  It can be a full
         // RFC822 document or a headerless multipart payload; normalize()
         // handles both forms before MailCore parses the body.
-        const string raw = bodyValue({"raw", "rawContent", "messageRaw", "mimeContent"});
         if (!raw.empty()) result.mime = SmarterMailRawMessage::normalize(raw);
     }
     // The detail and list APIs do not use a perfectly consistent shape across

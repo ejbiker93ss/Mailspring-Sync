@@ -32,6 +32,7 @@
 #include "FolderSyncPolicy.hpp"
 #include "SmarterMailClient.hpp"
 #include "SmarterMailHeaders.hpp"
+#include "SmarterMailRawMessage.hpp"
 #include "MoveResult.hpp"
 
 
@@ -1262,6 +1263,22 @@ void SyncWorker::syncSmarterMailMessageBody(Message * message, bool background)
     const bool hasAttachments = body.hasAttachments || message->_data.value("smHasAttachments", false);
     bool attachmentMimeLoaded = !hasAttachments;
     bool usedRawMime = false;
+    if (SmarterMailRawMessage::hasBlockedRemoteImages(body.mime)) {
+        // Persist before the recovery request so a failed read cannot cause
+        // repeated downloads every time the conversation is opened.
+        message->_data["smImageRepairAttempt"] = time(0);
+        store->save(message);
+        try {
+            const string original = client.rawMessage(path, message->remoteUID());
+            if (SmarterMailRawMessage::isOriginalDisplayMime(original)) {
+                body.mime = original;
+                usedRawMime = true;
+            }
+        } catch (const SyncException &) {
+            // Keep readable HTML when original-source recovery is unavailable.
+            // Opening again after the repair cooldown can retry.
+        }
+    }
     if (body.mime.empty()) {
         // Raw RFC822 is a compatibility fallback only. Running it beside or
         // after a valid structured response makes SmarterMail serialize extra
