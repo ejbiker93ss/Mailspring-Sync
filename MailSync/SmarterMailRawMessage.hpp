@@ -88,12 +88,88 @@ inline bool isClosingBoundaryOnly(const std::string & value) {
     return true;
 }
 
+inline bool isEscapedHTMLDocument(const std::string & value) {
+    const std::string candidate = lowerCopy(trimmedCopy(value));
+    return candidate.rfind("&lt;!doctype html", 0) == 0 ||
+           candidate.rfind("&lt;html", 0) == 0 ||
+           candidate.rfind("&lt;body", 0) == 0;
+}
+
+inline void appendUTF8(std::string & output, unsigned int codePoint) {
+    if (codePoint <= 0x7F) {
+        output.push_back(static_cast<char>(codePoint));
+    } else if (codePoint <= 0x7FF) {
+        output.push_back(static_cast<char>(0xC0 | (codePoint >> 6)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    } else if (codePoint <= 0xFFFF) {
+        output.push_back(static_cast<char>(0xE0 | (codePoint >> 12)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    } else if (codePoint <= 0x10FFFF) {
+        output.push_back(static_cast<char>(0xF0 | (codePoint >> 18)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        output.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+}
+
+inline std::string decodeHTMLEntities(const std::string & html) {
+    std::string decoded;
+    decoded.reserve(html.size());
+    for (size_t ii = 0; ii < html.size();) {
+        if (html[ii] != '&') {
+            decoded.push_back(html[ii++]);
+            continue;
+        }
+        const size_t end = html.find(';', ii + 1);
+        if (end == std::string::npos || end - ii > 16) {
+            decoded.push_back(html[ii++]);
+            continue;
+        }
+
+        const std::string entity = html.substr(ii + 1, end - ii - 1);
+        unsigned int codePoint = 0;
+        bool recognized = false;
+        if (entity == "lt") { codePoint = '<'; recognized = true; }
+        else if (entity == "gt") { codePoint = '>'; recognized = true; }
+        else if (entity == "amp") { codePoint = '&'; recognized = true; }
+        else if (entity == "quot") { codePoint = '"'; recognized = true; }
+        else if (entity == "apos") { codePoint = '\''; recognized = true; }
+        else if (entity == "nbsp") { codePoint = 0xA0; recognized = true; }
+        else if (entity.size() > 1 && entity[0] == '#') {
+            try {
+                size_t parsed = 0;
+                const bool hex = entity.size() > 2 && (entity[1] == 'x' || entity[1] == 'X');
+                const unsigned long value = std::stoul(entity.substr(hex ? 2 : 1), &parsed, hex ? 16 : 10);
+                if (parsed == entity.size() - (hex ? 2 : 1) && value <= 0x10FFFF &&
+                    !(value >= 0xD800 && value <= 0xDFFF)) {
+                    codePoint = static_cast<unsigned int>(value);
+                    recognized = true;
+                }
+            } catch (...) {}
+        }
+        if (recognized) {
+            appendUTF8(decoded, codePoint);
+            ii = end + 1;
+        } else {
+            decoded.append(html, ii, end - ii + 1);
+            ii = end + 1;
+        }
+    }
+    return decoded;
+}
+
+inline std::string decodeEscapedHTMLDocument(const std::string & value) {
+    return isEscapedHTMLDocument(value) ? decodeHTMLEntities(value) : value;
+}
+
 inline std::string structuredBodyMime(const std::string & html, const std::string & text) {
-    if (!html.empty()) {
+    const std::string displayHTML = decodeEscapedHTMLDocument(html);
+    if (!displayHTML.empty()) {
         return "MIME-Version: 1.0\r\n"
                "Content-Type: text/html; charset=utf-8\r\n"
                "Content-Transfer-Encoding: 8bit\r\n"
-               "\r\n" + html;
+               "\r\n" + displayHTML;
     }
     if (!text.empty()) {
         return "MIME-Version: 1.0\r\n"
@@ -249,8 +325,9 @@ inline bool isOriginalDisplayMime(const std::string & raw) {
 
 inline std::string displayMime(const std::string & html, const std::string & text,
                                const std::string & raw) {
-    if (hasBlockedRemoteImages(html) && isOriginalDisplayMime(raw)) return normalize(raw);
-    return structuredBodyMime(html, text);
+    const std::string displayHTML = decodeEscapedHTMLDocument(html);
+    if (hasBlockedRemoteImages(displayHTML) && isOriginalDisplayMime(raw)) return normalize(raw);
+    return structuredBodyMime(displayHTML, text);
 }
 
 } // namespace SmarterMailRawMessage

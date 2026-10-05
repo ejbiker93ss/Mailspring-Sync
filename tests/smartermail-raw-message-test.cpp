@@ -96,5 +96,18 @@ int main() {
     // Do not replace healthy structured HTML just because raw was supplied.
     assert(SmarterMailRawMessage::displayMime(originalHTML, "", validMultipart) == originalMIME);
 
+    const std::string entityEncodedDocument =
+        "&lt;!DOCTYPE html&gt;&lt;html&gt;&lt;body&gt;"
+        "<p title=&quot;A &amp; B&quot;&gt;Meet Passion Fruit &amp; enjoy &#x1F334;"
+        "&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;";
+    const std::string decodedDocument = SmarterMailRawMessage::decodeEscapedHTMLDocument(entityEncodedDocument);
+    assert(decodedDocument.find("<!DOCTYPE html><html><body>") == 0);
+    assert(decodedDocument.find("title=\"A & B\">") != std::string::npos);
+    assert(decodedDocument.find("Meet Passion Fruit & enjoy \xF0\x9F\x8C\xB4") != std::string::npos);
+    assert(SmarterMailRawMessage::structuredBodyMime(entityEncodedDocument, "") ==
+        SmarterMailRawMessage::structuredBodyMime(decodedDocument, ""));
+    const std::string ordinaryText = "The text &lt;html&gt; is a literal example.";
+    assert(SmarterMailRawMessage::decodeEscapedHTMLDocument(ordinaryText) == ordinaryText);
+
     return 0;
 }
