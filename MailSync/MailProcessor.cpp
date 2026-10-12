@@ -478,8 +478,20 @@ bool MailProcessor::retrievedMessageBody(Message * message, MessageParser * pars
 
     if (html->hasPrefix(MCSTR("PLAINTEXT:"))) {
         text = html->substringFromIndex(10);
-        transformedBody = text->UTF8Characters();
         bodyIsPlaintext = true;
+    } else {
+        bodyIsPlaintext = false;
+    }
+    // Original MIME recovery can bypass the structured HTML decoder. Repair
+    // complete escaped documents here too, before deriving the preview.
+    if (account->usesSmarterMailAPI() &&
+        (SmarterMailRawMessage::isEscapedHTMLDocument(text->UTF8Characters()) ||
+         (bodyIsPlaintext && SmarterMailRawMessage::isBareHTMLDocument(text->UTF8Characters())))) {
+        html = AS_MCSTR(SmarterMailRawMessage::decodeEscapedHTMLDocument(text->UTF8Characters()));
+        bodyIsPlaintext = false;
+    }
+    if (bodyIsPlaintext) {
+        transformedBody = text->UTF8Characters();
     } else {
         String * flattenedHTML = html->flattenHTML();
         if (flattenedHTML != NULL) {
@@ -489,7 +501,6 @@ bool MailProcessor::retrievedMessageBody(Message * message, MessageParser * pars
             text = MCSTR("");
         }
         transformedBody = html->UTF8Characters();
-        bodyIsPlaintext = false;
     }
     if (!bodyIsPlaintext && htmlTransform) transformedBody = htmlTransform(transformedBody);
     bodyRepresentation = transformedBody.c_str();

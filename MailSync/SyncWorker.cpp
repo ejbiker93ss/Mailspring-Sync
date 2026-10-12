@@ -1259,6 +1259,10 @@ void SyncWorker::syncSmarterMailMessageBody(Message * message, bool background)
     if (path.empty()) return;
     SmarterMailClient client(account);
     const auto startedAt = chrono::steady_clock::now();
+    // Persist the attempt before fetching so malformed cached HTML has a
+    // bounded retry cadence even when the provider request fails.
+    message->_data["smHtmlRepairAttempt"] = time(0);
+    store->save(message);
     SmarterMailMessageBody body = client.messageBody(path, message->remoteUID());
     const bool hasAttachments = body.hasAttachments || message->_data.value("smHasAttachments", false);
     bool attachmentMimeLoaded = !hasAttachments;
