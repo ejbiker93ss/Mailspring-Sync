@@ -10,6 +10,12 @@ int main() {
         "_006_SA3PR14MB70263191E524297F7A46DFA4C2B8SA3PR14MB7026namp_--"));
     assert(SmarterMailRawMessage::isClosingBoundaryOnly("--==_mimepart_example--\r\n"));
     assert(SmarterMailRawMessage::isClosingBoundaryOnly("=-xGT7zo0wYKfbQCXRPNNBFQ==--"));
+    assert(SmarterMailRawMessage::isClosingBoundaryOnly("0000000000009ba7be065df4973d--"));
+    assert(SmarterMailRawMessage::isClosingBoundaryOnly(" \r\n0000000000009BA7BE065DF4973D--\r\n"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("0123456789abcdef--"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("0000000000009ba7be065df4973z--"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("0000000000009ba7be065df4973d"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("See 0000000000009ba7be065df4973d--"));
     assert(!SmarterMailRawMessage::isClosingBoundaryOnly("Thanks --"));
     assert(!SmarterMailRawMessage::isClosingBoundaryOnly(
         "<html><body>_005_BYAPR17MB2456namp_--</body></html>"));

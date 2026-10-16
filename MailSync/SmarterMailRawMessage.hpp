@@ -76,7 +76,14 @@ inline bool isClosingBoundaryOnly(const std::string & value) {
     if (candidate.size() < 12 || candidate.size() > 240 ||
         !endsWith(candidate, "--") ||
         candidate.find_first_of("\r\n \t") != std::string::npos) return false;
-    const bool recognizedPrefix = candidate[0] == '_' ||
+    // Gmail-style boundaries can be bare hexadecimal tokens, with neither
+    // Outlook's underscore nor the opening delimiter's leading hyphens.
+    const size_t tokenLength = candidate.size() - 2;
+    bool hexadecimalToken = tokenLength >= 24 && tokenLength <= 70;
+    for (size_t ii = 0; hexadecimalToken && ii < tokenLength; ++ii) {
+        hexadecimalToken = std::isxdigit(static_cast<unsigned char>(candidate[ii])) != 0;
+    }
+    const bool recognizedPrefix = hexadecimalToken || candidate[0] == '_' ||
                                   candidate.compare(0, 2, "--") == 0 ||
                                   candidate.compare(0, 2, "=-") == 0;
     if (!recognizedPrefix) return false;

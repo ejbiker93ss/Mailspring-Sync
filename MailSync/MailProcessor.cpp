@@ -510,7 +510,7 @@ bool MailProcessor::retrievedMessageBody(Message * message, MessageParser * pars
     // structured body. MailCore accepts that fragment as plaintext, so reject
     // it here before it can poison the local cache. The caller can then use
     // the full raw MIME representation for this exceptional message only.
-    if (SmarterMailRawMessage::isClosingBoundaryOnly(transformedBody)) {
+    if (account->usesSmarterMailAPI() && SmarterMailRawMessage::isClosingBoundaryOnly(transformedBody)) {
         logger->warn("Rejected closing MIME boundary returned as message body for {}", message->id());
         return false;
     }

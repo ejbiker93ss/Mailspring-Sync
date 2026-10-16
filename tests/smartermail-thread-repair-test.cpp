@@ -32,6 +32,13 @@ int main() {
     auto a = insert(1, "placeholder-a");
     auto b = insert(2, "placeholder-b");
     auto unrelated = insert(3, "unrelated");
+    const std::string boundaryMime = "Content-Type: text/plain\r\n\r\n0000000000009ba7be065df4973d--";
+    auto boundaryParser = MessageParser::messageParserWithData(
+        Data::dataWithBytes(boundaryMime.data(), (unsigned int)boundaryMime.size()));
+    assert(!processor.retrievedMessageBody(b.get(), boundaryParser));
+    SQLite::Statement rejectedBody(store.db(), "SELECT COUNT(*) FROM MessageBody");
+    assert(rejectedBody.executeStep() && rejectedBody.getColumn(0).getInt() == 0);
+    rejectedBody.reset();
     const auto aid = a->id(), bid = b->id();
     auto heal = [&](Message * m, const char * mid, const char * refs) {
         auto mime = SmarterMailHeaders::mime(json{{"header", std::string("Message-Id: ") + mid + "\r\nReferences: " + refs + "\r\n"}}) + "Content-Type: text/plain\r\n\r\nHello preview";
@@ -45,6 +52,11 @@ int main() {
     auto currentB = store.find<Message>(Query().equal("id", bid));
     assert(currentA->threadId() == currentB->threadId());
     assert(currentA->threadId() != unrelated->threadId());
+    assert(currentB->headerMessageId() == "child@host");
+    SQLite::Statement recoveredBody(store.db(), "SELECT value FROM MessageBody WHERE id = ?");
+    recoveredBody.bind(1, bid);
+    assert(recoveredBody.executeStep() && recoveredBody.getColumn(0).getString() == "Hello preview");
+    recoveredBody.reset();
     heal(b.get(), "<child@host>", "<root@host>");
     auto thread = store.find<Thread>(Query().equal("id", currentB->threadId()));
     assert(thread->unread() == 2);
