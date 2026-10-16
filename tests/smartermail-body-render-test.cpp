@@ -1,5 +1,7 @@
 #include "MailProcessor.hpp"
 #include "ThreadUtils.h"
+#include "SmarterMailHeaders.hpp"
+#include "SmarterMailRawMessage.hpp"
 #include <cassert>
 #include <iostream>
 
@@ -48,6 +50,26 @@ int main() {
     assert(bare.first->_data.value("snippet", "") == "Offer & savings");
     const auto healthy = render("text/html", html);
     assert(healthy.second == html);
+    // Optional original-image recovery can produce a complete MIME envelope
+    // whose only rendered content is its closing boundary. Reject that source
+    // without overwriting a readable cached body, then retain API references
+    // when the structured display is used as the fallback.
+    const std::string brokenOriginal = "MIME-Version: 1.0\r\n"
+        "Content-Type: text/plain\r\n\r\n0000000000009ba7be065df4973d--";
+    auto brokenParser = MessageParser::messageParserWithData(Data::dataWithBytes(
+        brokenOriginal.data(), (unsigned int)brokenOriginal.size()));
+    assert(!processor.retrievedMessageBody(healthy.first.get(), brokenParser));
+    const std::string fallback = SmarterMailHeaders::mime(json{{"header",
+        "Message-ID: <child@host>\r\nReferences: <root@host> <parent@host>\r\n"}}) +
+        SmarterMailRawMessage::structuredBodyMime(html, "Offer & savings");
+    auto fallbackParser = MessageParser::messageParserWithData(Data::dataWithBytes(
+        fallback.data(), (unsigned int)fallback.size()));
+    assert(processor.retrievedMessageBody(healthy.first.get(), fallbackParser));
+    assert(fallbackParser->header()->references()->count() == 2);
+    SQLite::Statement fallbackBody(store.db(), "SELECT value FROM MessageBody WHERE id = ?");
+    fallbackBody.bind(1, healthy.first->id());
+    assert(fallbackBody.executeStep() && fallbackBody.getColumn(0).getString() == html);
+    fallbackBody.reset();
     const std::string literal = "Use &lt;html&gt; as an example.";
     const auto text = render("text/plain", literal);
     assert(text.first->_data.value("plaintext", false));

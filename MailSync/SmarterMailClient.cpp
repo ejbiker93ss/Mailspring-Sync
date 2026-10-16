@@ -490,6 +490,10 @@ SmarterMailMessageBody SmarterMailClient::messageBody(const string & folder, uin
         response.count("raw") && response["raw"].is_string()) {
         raw = response["raw"].get<string>();
     }
+    result.structuredMime = SmarterMailRawMessage::structuredBodyMime(html, text);
+    if (!result.structuredMime.empty()) {
+        result.structuredMime = SmarterMailHeaders::mime(detail) + result.structuredMime;
+    }
     result.mime = SmarterMailRawMessage::displayMime(html, text, raw);
     const bool usedOriginal = SmarterMailRawMessage::hasBlockedRemoteImages(html) &&
         SmarterMailRawMessage::isOriginalDisplayMime(raw);

@@ -23,6 +23,8 @@ struct SmarterMailContactPage {
 
 struct SmarterMailMessageBody {
     std::string mime;
+    // Keep the readable API body when optional original-image recovery fails.
+    std::string structuredMime;
     // Safe diagnostics for malformed upstream responses: field names, JSON
     // types, and collection/string sizes only. Never contains message text.
     std::string responseShape;
