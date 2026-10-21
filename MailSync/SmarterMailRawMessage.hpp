@@ -83,7 +83,16 @@ inline bool isClosingBoundaryOnly(const std::string & value) {
     for (size_t ii = 0; hexadecimalToken && ii < tokenLength; ++ii) {
         hexadecimalToken = std::isxdigit(static_cast<unsigned char>(candidate[ii])) != 0;
     }
-    const bool recognizedPrefix = hexadecimalToken || candidate[0] == '_' ||
+    // Python's email generator (including Odoo) uses an equals-padded numeric
+    // boundary. SmarterMail can return its closing delimiter without `--`.
+    const size_t digitsStart = candidate.find_first_not_of('=');
+    const size_t digitsEnd = digitsStart == std::string::npos ? digitsStart
+        : candidate.find_first_not_of("0123456789", digitsStart);
+    const bool numericBoundary = digitsStart >= 3 && digitsStart < tokenLength &&
+        digitsEnd != std::string::npos && digitsEnd - digitsStart >= 10 &&
+        digitsEnd < tokenLength &&
+        candidate.substr(digitsEnd, tokenLength - digitsEnd).find_first_not_of('=') == std::string::npos;
+    const bool recognizedPrefix = hexadecimalToken || numericBoundary || candidate[0] == '_' ||
                                   candidate.compare(0, 2, "--") == 0 ||
                                   candidate.compare(0, 2, "=-") == 0;
     if (!recognizedPrefix) return false;

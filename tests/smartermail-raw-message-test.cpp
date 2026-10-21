@@ -11,6 +11,12 @@ int main() {
     assert(SmarterMailRawMessage::isClosingBoundaryOnly("--==_mimepart_example--\r\n"));
     assert(SmarterMailRawMessage::isClosingBoundaryOnly("=-xGT7zo0wYKfbQCXRPNNBFQ==--"));
     assert(SmarterMailRawMessage::isClosingBoundaryOnly("0000000000009ba7be065df4973d--"));
+    assert(SmarterMailRawMessage::isClosingBoundaryOnly("===============2440510202301742514==--"));
+    assert(SmarterMailRawMessage::isClosingBoundaryOnly(" \r\n===============7642107466783303552==--\r\n"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("===============2440510202301742514=="));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("===============example==--"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("===============123==--"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("See ===============2440510202301742514==--"));
     assert(SmarterMailRawMessage::isClosingBoundaryOnly(" \r\n0000000000009BA7BE065DF4973D--\r\n"));
     assert(!SmarterMailRawMessage::isClosingBoundaryOnly("0123456789abcdef--"));
     assert(!SmarterMailRawMessage::isClosingBoundaryOnly("0000000000009ba7be065df4973z--"));

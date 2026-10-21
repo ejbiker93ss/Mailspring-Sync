@@ -54,11 +54,17 @@ int main() {
     // whose only rendered content is its closing boundary. Reject that source
     // without overwriting a readable cached body, then retain API references
     // when the structured display is used as the fallback.
-    const std::string brokenOriginal = "MIME-Version: 1.0\r\n"
-        "Content-Type: text/plain\r\n\r\n0000000000009ba7be065df4973d--";
-    auto brokenParser = MessageParser::messageParserWithData(Data::dataWithBytes(
-        brokenOriginal.data(), (unsigned int)brokenOriginal.size()));
-    assert(!processor.retrievedMessageBody(healthy.first.get(), brokenParser));
+    for (const auto & delimiter : {"0000000000009ba7be065df4973d--",
+                                  "===============2440510202301742514==--"}) {
+        const std::string brokenOriginal = std::string("MIME-Version: 1.0\r\n") +
+            "Content-Type: text/plain\r\n\r\n" + delimiter;
+        auto brokenParser = MessageParser::messageParserWithData(Data::dataWithBytes(
+            brokenOriginal.data(), (unsigned int)brokenOriginal.size()));
+        assert(!processor.retrievedMessageBody(healthy.first.get(), brokenParser));
+        SQLite::Statement cached(store.db(), "SELECT value FROM MessageBody WHERE id = ?");
+        cached.bind(1, healthy.first->id());
+        assert(cached.executeStep() && cached.getColumn(0).getString() == html);
+    }
     const std::string fallback = SmarterMailHeaders::mime(json{{"header",
         "Message-ID: <child@host>\r\nReferences: <root@host> <parent@host>\r\n"}}) +
         SmarterMailRawMessage::structuredBodyMime(html, "Offer & savings");
