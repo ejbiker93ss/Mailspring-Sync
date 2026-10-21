@@ -44,6 +44,14 @@ int main() {
         assert(result.second.find("<!DOCTYPE html><html><body><p>Offer &amp; savings</p>") == 0);
         assert(result.first->_data.value("snippet", "") == "Offer & savings");
     }
+    const std::string escapedFragment =
+        "&lt;div dir=\"auto\"&gt;&lt;span&gt;Thank you&lt;/span&gt;&lt;br&gt;"
+        "&lt;div&gt;I will follow up.&lt;/div&gt;&lt;/div&gt;";
+    const auto fragment = render("text/plain", escapedFragment);
+    assert(!fragment.first->_data.value("plaintext", true));
+    assert(fragment.second ==
+        "<div dir=\"auto\"><span>Thank you</span><br><div>I will follow up.</div></div>");
+    assert(fragment.first->_data.value("snippet", "") == "Thank you I will follow up.");
     const auto bare = render("text/plain", html);
     assert(!bare.first->_data.value("plaintext", true));
     assert(bare.second == html);

@@ -106,9 +106,21 @@ inline bool isClosingBoundaryOnly(const std::string & value) {
 
 inline bool isEscapedHTMLDocument(const std::string & value) {
     const std::string candidate = lowerCopy(trimmedCopy(value));
-    return candidate.rfind("&lt;!doctype html", 0) == 0 ||
-           candidate.rfind("&lt;html", 0) == 0 ||
-           candidate.rfind("&lt;body", 0) == 0;
+    if (candidate.rfind("&lt;!doctype html", 0) == 0 ||
+        candidate.rfind("&lt;html", 0) == 0 ||
+        candidate.rfind("&lt;body", 0) == 0) return true;
+
+    // Some SmarterMail responses return an escaped HTML fragment directly
+    // (commonly an editor-generated <div>) without an html/body wrapper.
+    if (candidate.rfind("&lt;", 0) != 0) return false;
+    size_t tagEnd = 4;
+    while (tagEnd < candidate.size() &&
+           std::isalnum(static_cast<unsigned char>(candidate[tagEnd]))) tagEnd++;
+    if (tagEnd == 4 || tagEnd >= candidate.size() ||
+        (candidate[tagEnd] != ' ' && candidate.compare(tagEnd, 4, "&gt;") != 0)) return false;
+
+    const std::string closingTag = "&lt;/" + candidate.substr(4, tagEnd - 4) + "&gt;";
+    return candidate.find(closingTag, tagEnd) != std::string::npos;
 }
 
 inline void appendUTF8(std::string & output, unsigned int codePoint) {

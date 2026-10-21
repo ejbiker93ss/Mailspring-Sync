@@ -26,6 +26,18 @@ int main() {
     assert(!SmarterMailRawMessage::isClosingBoundaryOnly(
         "<html><body>_005_BYAPR17MB2456namp_--</body></html>"));
 
+    const std::string escapedFragment =
+        "&lt;div dir=\"auto\"&gt;&lt;span&gt;Thank you&lt;/span&gt;&lt;br&gt;"
+        "&lt;div&gt;I will follow up.&lt;/div&gt;&lt;/div&gt;";
+    const std::string escapedDocument =
+        "&lt;html&gt;&lt;body&gt;&lt;p&gt;Hello&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;";
+    assert(SmarterMailRawMessage::isEscapedHTMLDocument(escapedDocument));
+    assert(SmarterMailRawMessage::decodeEscapedHTMLDocument(escapedDocument) ==
+        "<html><body><p>Hello</p></body></html>");
+    assert(SmarterMailRawMessage::isEscapedHTMLDocument(escapedFragment));
+    assert(SmarterMailRawMessage::decodeEscapedHTMLDocument(escapedFragment) ==
+        "<div dir=\"auto\"><span>Thank you</span><br><div>I will follow up.</div></div>");
+
     const std::string structured = SmarterMailRawMessage::structuredBodyMime(
         "<html><body>Fast body</body></html>", "Fast body");
     assert(structured.find("Content-Type: text/html; charset=utf-8") != std::string::npos);
