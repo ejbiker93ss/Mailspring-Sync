@@ -92,7 +92,14 @@ inline bool isClosingBoundaryOnly(const std::string & value) {
         digitsEnd != std::string::npos && digitsEnd - digitsStart >= 10 &&
         digitsEnd < tokenLength &&
         candidate.substr(digitsEnd, tokenLength - digitsEnd).find_first_not_of('=') == std::string::npos;
-    const bool recognizedPrefix = hexadecimalToken || numericBoundary || candidate[0] == '_' ||
+    // Numbered multipart boundaries can lose their leading delimiter too,
+    // leaving only b1_<32 hex digits>-- in the structured body.
+    bool numberedBoundary = tokenLength == 35 && candidate[0] == 'b' &&
+        candidate[1] >= '1' && candidate[1] <= '3' && candidate[2] == '_';
+    for (size_t ii = 3; numberedBoundary && ii < tokenLength; ++ii) {
+        numberedBoundary = std::isxdigit(static_cast<unsigned char>(candidate[ii])) != 0;
+    }
+    const bool recognizedPrefix = hexadecimalToken || numericBoundary || numberedBoundary || candidate[0] == '_' ||
                                   candidate.compare(0, 2, "--") == 0 ||
                                   candidate.compare(0, 2, "=-") == 0;
     if (!recognizedPrefix) return false;

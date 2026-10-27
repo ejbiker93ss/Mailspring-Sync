@@ -26,6 +26,19 @@ int main() {
     assert(!SmarterMailRawMessage::isClosingBoundaryOnly(
         "<html><body>_005_BYAPR17MB2456namp_--</body></html>"));
 
+    for (const auto & prefix : {"b1_", "b2_", "b3_"}) {
+        const std::string boundary = std::string(prefix) + "714a42de12769362a3cd95f6c67c147e--";
+        assert(SmarterMailRawMessage::isClosingBoundaryOnly(boundary));
+        assert(SmarterMailRawMessage::isClosingBoundaryOnly(" \r\n" + boundary + "\r\n"));
+        assert(!SmarterMailRawMessage::isClosingBoundaryOnly("See " + boundary));
+        assert(!SmarterMailRawMessage::isClosingBoundaryOnly("<p>" + boundary + "</p>"));
+    }
+    assert(SmarterMailRawMessage::isClosingBoundaryOnly("b1_714A42DE12769362A3CD95F6C67C147E--"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("b1_714a42de12769362a3cd95f6c67c147e"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("b1_714a42de12769362a3cd95f6c67c147z--"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("b1_short--"));
+    assert(!SmarterMailRawMessage::isClosingBoundaryOnly("b4_714a42de12769362a3cd95f6c67c147e--"));
+
     const std::string escapedFragment =
         "&lt;div dir=\"auto\"&gt;&lt;span&gt;Thank you&lt;/span&gt;&lt;br&gt;"
         "&lt;div&gt;I will follow up.&lt;/div&gt;&lt;/div&gt;";

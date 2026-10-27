@@ -62,7 +62,8 @@ int main() {
     // whose only rendered content is its closing boundary. Reject that source
     // without overwriting a readable cached body, then retain API references
     // when the structured display is used as the fallback.
-    for (const auto & delimiter : {"0000000000009ba7be065df4973d--",
+    for (const auto & delimiter : {"b1_714a42de12769362a3cd95f6c67c147e--",
+                                  "0000000000009ba7be065df4973d--",
                                   "===============2440510202301742514==--"}) {
         const std::string brokenOriginal = std::string("MIME-Version: 1.0\r\n") +
             "Content-Type: text/plain\r\n\r\n" + delimiter;
