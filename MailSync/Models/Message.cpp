@@ -66,6 +66,7 @@ MailModel(MailUtils::idForMessage(folder.accountId(), folder.path(), msg), folde
     setRemoteFolder(&folder);
 
     _data["remoteUID"] = msg->uid();
+    if (msg->size() > 0) _data["size"] = msg->size();
     
     _data["files"] = json::array();
     _data["date"] = msg->header()->date() == -1 ? msg->header()->receivedDate() : msg->header()->date();

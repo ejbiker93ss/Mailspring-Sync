@@ -864,15 +864,15 @@ IMAPMessagesRequestKind MailUtils::messagesRequestKindFor(IndexSet * capabilitie
     
     if (heavyOrNeedToComputeIDs) {
         if (gmail) {
-            return IMAPMessagesRequestKind(IMAPMessagesRequestKindHeaders | IMAPMessagesRequestKindInternalDate | IMAPMessagesRequestKindFlags | IMAPMessagesRequestKindGmailLabels | IMAPMessagesRequestKindGmailThreadID | IMAPMessagesRequestKindGmailMessageID);
+            return IMAPMessagesRequestKind(IMAPMessagesRequestKindHeaders | IMAPMessagesRequestKindSize | IMAPMessagesRequestKindInternalDate | IMAPMessagesRequestKindFlags | IMAPMessagesRequestKindGmailLabels | IMAPMessagesRequestKindGmailThreadID | IMAPMessagesRequestKindGmailMessageID);
         }
-        return IMAPMessagesRequestKind(IMAPMessagesRequestKindHeaders | IMAPMessagesRequestKindInternalDate | IMAPMessagesRequestKindFlags);
+        return IMAPMessagesRequestKind(IMAPMessagesRequestKindHeaders | IMAPMessagesRequestKindSize | IMAPMessagesRequestKindInternalDate | IMAPMessagesRequestKindFlags);
     }
     
     if (gmail) {
-        return IMAPMessagesRequestKind(IMAPMessagesRequestKindFlags | IMAPMessagesRequestKindGmailLabels);
+        return IMAPMessagesRequestKind(IMAPMessagesRequestKindFlags | IMAPMessagesRequestKindSize | IMAPMessagesRequestKindGmailLabels);
     }
-    return IMAPMessagesRequestKind(IMAPMessagesRequestKindFlags);
+    return IMAPMessagesRequestKind(IMAPMessagesRequestKindFlags | IMAPMessagesRequestKindSize);
 }
 
 

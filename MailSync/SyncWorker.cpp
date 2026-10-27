@@ -1182,6 +1182,12 @@ bool SyncWorker::syncSmarterMailMessages()
                 const bool hasAttachments = smBool(remote, {"hasAttachments", "hasAttachment"}) ||
                     (remote.count("attachments") && remote["attachments"].is_array() && !remote["attachments"].empty());
                 local->_data["smHasAttachments"] = hasAttachments;
+                for (const auto & key : {"size", "messageSize"}) {
+                    if (remote.contains(key) && remote[key].is_number() && remote[key].get<int64_t>() > 0) {
+                        local->_data["size"] = remote[key].get<int64_t>();
+                        break;
+                    }
+                }
                 if (!hasAttachments) local->_data["smAttachmentHydratedV1"] = true;
                 local->setSyncedAt(startedAt);
                 store->save(local.get());

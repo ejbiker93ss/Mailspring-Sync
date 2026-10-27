@@ -248,7 +248,7 @@ void MailProcessor::updateMessage(Message * local, IMAPMessage * remote, Folder 
         }
     }
 
-    bool noChanges = true;
+    bool noChanges = remote->size() == 0 || local->_data.value("size", (uint64_t)0) == remote->size();
     if (updated.unread != local->isUnread()) {
         if (noChanges) logger->info("- Updating message {}", local->id());
         logger->info("-- Unread ({} to {})", local->isUnread(), updated.unread);
@@ -288,6 +288,7 @@ void MailProcessor::updateMessage(Message * local, IMAPMessage * remote, Folder 
         MailStoreTransaction transaction{store, "updateMessage"};
     
         local->setUnread(updated.unread);
+        if (remote->size() > 0) local->_data["size"] = remote->size();
         local->setStarred(updated.starred);
         local->setDraft(updated.draft);
         local->setRemoteUID(updated.uid);
