@@ -44,6 +44,14 @@ int main() {
         assert(result.second.find("<!DOCTYPE html><html><body><p>Offer &amp; savings</p>") == 0);
         assert(result.first->_data.value("snippet", "") == "Offer & savings");
     }
+    const std::string bom = "\xEF\xBB\xBF";
+    for (const auto & type : {"text/html", "text/plain"}) {
+        const auto result = render(type, bom + escaped);
+        assert(!result.first->_data.value("plaintext", true));
+        assert(result.second.find("<!DOCTYPE html><html><body><p>Offer &amp; savings</p>") != std::string::npos);
+        assert(result.second.find("&lt;!DOCTYPE") == std::string::npos);
+        assert(result.first->_data.value("snippet", "") == "Offer & savings");
+    }
     const std::string escapedFragment =
         "&lt;div dir=\"auto\"&gt;&lt;span&gt;Thank you&lt;/span&gt;&lt;br&gt;"
         "&lt;div&gt;I will follow up.&lt;/div&gt;&lt;/div&gt;";

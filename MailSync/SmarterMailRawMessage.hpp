@@ -112,7 +112,8 @@ inline bool isClosingBoundaryOnly(const std::string & value) {
 }
 
 inline bool isEscapedHTMLDocument(const std::string & value) {
-    const std::string candidate = lowerCopy(trimmedCopy(value));
+    // A UTF-8 BOM can precede the escaped document in SmarterMail bodies.
+    const std::string candidate = lowerCopy(value.substr(firstContentOffset(value)));
     if (candidate.rfind("&lt;!doctype html", 0) == 0 ||
         candidate.rfind("&lt;html", 0) == 0 ||
         candidate.rfind("&lt;body", 0) == 0) return true;

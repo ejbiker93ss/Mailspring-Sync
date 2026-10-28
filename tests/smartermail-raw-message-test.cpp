@@ -51,6 +51,17 @@ int main() {
     assert(SmarterMailRawMessage::decodeEscapedHTMLDocument(escapedFragment) ==
         "<div dir=\"auto\"><span>Thank you</span><br><div>I will follow up.</div></div>");
 
+    const std::string bom = "\xEF\xBB\xBF";
+    for (const auto & body : {escapedDocument, escapedFragment}) {
+        assert(SmarterMailRawMessage::isEscapedHTMLDocument(bom + body));
+        assert(SmarterMailRawMessage::decodeEscapedHTMLDocument(bom + body) ==
+            bom + SmarterMailRawMessage::decodeEscapedHTMLDocument(body));
+        assert(SmarterMailRawMessage::structuredBodyMime(bom + body, "") ==
+            SmarterMailRawMessage::structuredBodyMime(
+                bom + SmarterMailRawMessage::decodeEscapedHTMLDocument(body), ""));
+    }
+    assert(!SmarterMailRawMessage::isEscapedHTMLDocument(bom + "Use &lt;html&gt; here."));
+
     const std::string structured = SmarterMailRawMessage::structuredBodyMime(
         "<html><body>Fast body</body></html>", "Fast body");
     assert(structured.find("Content-Type: text/html; charset=utf-8") != std::string::npos);
