@@ -17,8 +17,118 @@
 #endif
 #include <sys/stat.h>
 #include <libetpan/libetpan.h>
+#include <ctype.h>
+#include <map>
+#include <string>
 
 using namespace mailcore;
+
+static int rfc2231HexValue(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void rfc2231AppendPercentDecoded(std::string & output, const char * value)
+{
+    for (const char * p = value; * p != 0; p ++) {
+        if (* p == '%' && p[1] != 0 && p[2] != 0) {
+            int high = rfc2231HexValue(p[1]);
+            int low = rfc2231HexValue(p[2]);
+            if (high >= 0 && low >= 0) {
+                output.push_back((char) (high * 16 + low));
+                p += 2;
+                continue;
+            }
+        }
+        output.push_back(* p);
+    }
+}
+
+// Long or non-ASCII attachment names are sent as RFC 2231 parameters, either
+// as one extended value (filename*=utf-8''name) or as numbered pieces
+// (filename*0*=utf-8''part1; filename*1*=part2). libetpan reports those as
+// unrecognized parameters, so reassemble and decode them here.
+static String * rfc2231ParameterValue(clist * params, bool dispositionParams, const char * base)
+{
+    if (params == NULL) return NULL;
+    const size_t baseLength = strlen(base);
+    std::map<int, std::pair<bool, std::string> > pieces;
+    bool hasSingle = false;
+    std::string single;
+
+    for (clistiter * iter = clist_begin(params); iter != NULL; iter = clist_next(iter)) {
+        struct mailmime_parameter * param;
+        if (dispositionParams) {
+            struct mailmime_disposition_parm * dsp = (struct mailmime_disposition_parm *) clist_content(iter);
+            if (dsp == NULL || dsp->pa_type != MAILMIME_DISPOSITION_PARM_PARAMETER) continue;
+            param = dsp->pa_data.pa_parameter;
+        }
+        else {
+            param = (struct mailmime_parameter *) clist_content(iter);
+        }
+        if (param == NULL || param->pa_name == NULL || param->pa_value == NULL) continue;
+        if (strncasecmp(param->pa_name, base, baseLength) != 0 || param->pa_name[baseLength] != '*') continue;
+
+        const char * rest = param->pa_name + baseLength + 1;
+        if (* rest == 0) {
+            hasSingle = true;
+            single = param->pa_value;
+            continue;
+        }
+        if (!isdigit((unsigned char) * rest)) continue;
+        int index = 0;
+        while (isdigit((unsigned char) * rest) && index < 1000) {
+            index = index * 10 + (* rest - '0');
+            rest ++;
+        }
+        bool encoded = false;
+        if (* rest == '*') {
+            encoded = true;
+            rest ++;
+        }
+        if (* rest != 0 || index >= 1000) continue;
+        pieces[index] = std::make_pair(encoded, std::string(param->pa_value));
+    }
+
+    std::string charset;
+    std::string bytes;
+    bool anyEncoded = false;
+    // The first encoded piece starts with charset'language'.
+    auto appendEncoded = [&](const std::string & value, bool first) {
+        const char * start = value.c_str();
+        if (first) {
+            const char * firstQuote = strchr(start, '\'');
+            const char * secondQuote = firstQuote ? strchr(firstQuote + 1, '\'') : NULL;
+            if (secondQuote != NULL) {
+                charset.assign(start, firstQuote - start);
+                start = secondQuote + 1;
+            }
+        }
+        rfc2231AppendPercentDecoded(bytes, start);
+        anyEncoded = true;
+    };
+
+    if (hasSingle) {
+        appendEncoded(single, true);
+    }
+    else {
+        for (int i = 0; pieces.count(i) > 0; i ++) {
+            const std::pair<bool, std::string> & piece = pieces[i];
+            if (piece.first) appendEncoded(piece.second, i == 0);
+            else bytes += piece.second;
+        }
+    }
+    if (bytes.empty()) return NULL;
+    if (!anyEncoded) return String::stringByDecodingMIMEHeaderValue(bytes.c_str());
+
+    Data * data = Data::dataWithBytes(bytes.data(), (unsigned int) bytes.size());
+    String * result = String::stringWithData(data, charset.empty() ? "utf-8" : charset.c_str());
+    if (result == NULL || result->length() == 0) return NULL;
+    return result;
+}
 
 static char * findBlank(const char * str)
 {
@@ -573,8 +683,20 @@ Attachment * Attachment::attachmentWithSingleMIME(struct mailmime * mime)
     if (filename != NULL) {
         result->setFilename(String::stringByDecodingMIMEHeaderValue(filename));
     }
-    else if (name != NULL) {
-        result->setFilename(String::stringByDecodingMIMEHeaderValue(name));
+    else {
+        String * extendedFilename = single_fields.fld_disposition != NULL
+            ? rfc2231ParameterValue(single_fields.fld_disposition->dsp_parms, true, "filename")
+            : NULL;
+        if (extendedFilename != NULL) {
+            result->setFilename(extendedFilename);
+        }
+        else if (name != NULL) {
+            result->setFilename(String::stringByDecodingMIMEHeaderValue(name));
+        }
+        else {
+            String * extendedName = rfc2231ParameterValue(ct_parameters, false, "name");
+            if (extendedName != NULL) result->setFilename(extendedName);
+        }
     }
     if (content_id != NULL) {
         result->setContentID(String::stringWithUTF8Characters(content_id));
