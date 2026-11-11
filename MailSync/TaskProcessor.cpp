@@ -1957,8 +1957,14 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
         SmarterMailClient client(account);
         const string composeGuid = SmarterMailCompose::guid();
         json attachments = json::array(), names = json::array();
+        const auto files = draft.files();
+        // Reserve names up front so a generated suffix can't take a later file's name.
+        set<string> originalNames;
+        for (const auto & fileJSON : files) {
+            originalNames.insert(SmarterMailCompose::attachmentNameKey(File(fileJSON).filename()));
+        }
         set<string> stagedNames;
-        for (auto & fileJSON : draft.files()) {
+        for (const auto & fileJSON : files) {
             File file(fileJSON);
             const string root = MailUtils::getEnvUTF8("CONFIG_DIR_PATH") + FS_PATH_SEP + "files";
             const string path = MailUtils::pathForFile(root, &file, false);
@@ -1985,8 +1991,7 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
                 }
                 if (embedded) continue;
             }
-            const string filename = file.filename();
-            if (!stagedNames.insert(filename).second) throw SyncException("smartermail-duplicate-attachment-name", "Rename attachments with identical filenames before sending; no email was sent.", false);
+            const string filename = SmarterMailCompose::uniqueAttachmentName(file.filename(), originalNames, stagedNames);
             client.uploadComposeAttachment(composeGuid, filename, type, bytes);
             attachments.push_back({{"filename", filename}, {"fileName", filename}, {"Filename", filename}, {"FileName", filename},
                 {"attachmentName", filename}, {"AttachmentName", filename}, {"name", filename}, {"Name", filename},

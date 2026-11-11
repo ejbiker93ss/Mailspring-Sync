@@ -3,8 +3,32 @@
 #include "MailStore.hpp"
 #include "SyncException.hpp"
 #include <random>
+#include <set>
 
 namespace SmarterMailCompose {
+inline std::string attachmentNameKey(std::string filename) {
+    for (char & ch : filename) {
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+    }
+    return filename;
+}
+
+inline std::string uniqueAttachmentName(const std::string & filename,
+                                        const std::set<std::string> & originalNames,
+                                        std::set<std::string> & stagedNames) {
+    if (stagedNames.insert(attachmentNameKey(filename)).second) return filename;
+
+    const auto dot = filename.find_last_of('.');
+    const bool hasExtension = dot != std::string::npos && dot > 0 && dot + 1 < filename.size();
+    const auto stem = hasExtension ? filename.substr(0, dot) : filename;
+    const auto extension = hasExtension ? filename.substr(dot) : "";
+    for (size_t number = 2; ; ++number) {
+        const auto candidate = stem + " (" + std::to_string(number) + ")" + extension;
+        const auto key = attachmentNameKey(candidate);
+        if (!originalNames.count(key) && stagedNames.insert(key).second) return candidate;
+    }
+}
+
 inline bool usableParent(Message & draft, Message & parent) {
     return parent.accountId() == draft.accountId() && parent.remoteUID() != 0 &&
         parent.remoteUID() <= UINT32_MAX - 5 &&
