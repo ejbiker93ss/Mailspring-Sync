@@ -43,6 +43,8 @@ public:
     nlohmann::json taskOperation(const nlohmann::json & request);
     std::vector<nlohmann::json> folders();
     SmarterMailPage messages(const std::string & folder, unsigned int skip, unsigned int take);
+    uint32_t findMovedMessageUID(const std::string & folder, const std::string & subject,
+                                 const std::string & messageId);
     SmarterMailMessageBody messageBody(const std::string & folder, uint32_t uid);
     std::string rawMessage(const std::string & folder, uint32_t uid);
     std::string attachmentBytes(const nlohmann::json & attachment,

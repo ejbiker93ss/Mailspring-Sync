@@ -1,7 +1,9 @@
 #pragma once
 #include "Message.hpp"
 #include "MailStore.hpp"
+#include "SmarterMailHeaders.hpp"
 #include "SyncException.hpp"
+#include <functional>
 #include <random>
 #include <set>
 
@@ -38,7 +40,9 @@ inline bool usableParent(Message & draft, Message & parent) {
 // A moved message can leave a nonphysical local placeholder at the ID saved
 // in a draft. Recover only from a unique physical copy of the same Internet ID
 // in the same account; guessing between duplicates could forward the wrong mail.
-inline std::shared_ptr<Message> resolveParent(MailStore & store, Message & draft) {
+using MovedMessageLookup = std::function<uint32_t(const std::string &, const std::string &, const std::string &)>;
+inline std::shared_ptr<Message> resolveParent(MailStore & store, Message & draft,
+                                              const MovedMessageLookup & lookup = {}) {
     std::shared_ptr<Message> parent;
     const auto localParent = draft._data.find("replyToMessageId");
     if (localParent != draft._data.end() && localParent->is_string()) {
@@ -49,15 +53,30 @@ inline std::shared_ptr<Message> resolveParent(MailStore & store, Message & draft
 
     const std::string mid = draft.forwardedHeaderMessageId().empty()
         ? draft.replyToHeaderMessageId() : draft.forwardedHeaderMessageId();
-    if (mid.empty()) return nullptr;
-    std::shared_ptr<Message> match;
-    for (auto & candidate : store.findAll<Message>(Query().equal("accountId", draft.accountId())
-        .equal("headerMessageId", mid))) {
-        if (!usableParent(draft, *candidate)) continue;
-        if (match && match->id() != candidate->id()) return nullptr;
-        match = candidate;
+    std::string destination, moveId;
+    if (parent && parent->_data.count("smPendingMove") && parent->_data["smPendingMove"].is_object()) {
+        const auto & move = parent->_data["smPendingMove"];
+        destination = move.value("destinationFolder", "");
+        moveId = SmarterMailHeaders::ids(move.value("messageId", ""));
+        if (destination.empty() || destination != parent->remoteFolder().value("path", "")) return nullptr;
     }
-    return match;
+    std::shared_ptr<Message> match;
+    if (!mid.empty()) {
+        for (auto & candidate : store.findAll<Message>(Query().equal("accountId", draft.accountId())
+            .equal("headerMessageId", mid))) {
+            if (!usableParent(draft, *candidate)) continue;
+            if (!destination.empty() && candidate->remoteFolder().value("path", "") != destination) continue;
+            if (match && match->id() != candidate->id()) return nullptr;
+            match = candidate;
+        }
+    }
+    if (match) return match;
+    if (!lookup || moveId.empty() || (!mid.empty() && SmarterMailHeaders::ids(mid) != moveId)) return nullptr;
+    const auto uid = lookup(destination, parent->subject(), moveId);
+    if (!uid || uid > UINT32_MAX - 5) return nullptr;
+    // Only the send needs these coordinates. The sync worker owns cache reconciliation.
+    parent->setRemoteUID(uid);
+    return parent;
 }
 
 inline std::string guid() {
@@ -98,6 +117,9 @@ inline nlohmann::json payload(Message & draft, const std::string & owner,
          !draft._data["replyToMessageId"].get<std::string>().empty()));
     if (reply || forward) {
         if (!parent || !usableParent(draft, *parent)) {
+            // The forward draft already contains the quoted message and its files.
+            // Only the server-side link to the original requires a physical parent.
+            if (forward) return result;
             throw SyncException("smartermail-reply-parent-missing", "Cannot locate the original message on SmarterMail. Reopen it and reply again; no email was sent.", false);
         }
         result["replyUid"] = parent->remoteUID();

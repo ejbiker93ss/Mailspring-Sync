@@ -64,4 +64,37 @@ inline uint32_t newlyObserved(const std::vector<nlohmann::json> & rows, const st
     }
     return found;
 }
+
+// Folder listings on some versions omit the Internet Message-ID. Use the
+// subject only to shortlist a few detail reads, never as proof of identity.
+template<typename ReadMessageId>
+uint32_t movedMessageUID(const std::vector<nlohmann::json> & rows, const std::string & subject,
+                         const std::string & target, ReadMessageId readMessageId) {
+    constexpr size_t maxDetailReads = 4;
+    if (target.empty()) return 0;
+    std::set<uint32_t> unchecked;
+    uint32_t found = 0;
+    for (const auto & row : rows) {
+        if (!row.is_object()) continue;
+        const auto id = rowUID(row);
+        if (!id) continue;
+        const auto mid = messageId(row);
+        if (mid == target) {
+            if (found && found != id) return 0;
+            found = id;
+        } else if (mid.empty() && row.count("subject") && row["subject"] == subject) {
+            unchecked.insert(id);
+        }
+    }
+    unchecked.erase(found);
+    if (unchecked.size() > maxDetailReads) return 0;
+    for (auto id : unchecked) {
+        const auto mid = readMessageId(id);
+        if (mid.empty()) return 0;
+        if (mid != target) continue;
+        if (found) return 0;
+        found = id;
+    }
+    return found;
+}
 }

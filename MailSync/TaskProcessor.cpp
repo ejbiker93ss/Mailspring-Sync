@@ -1952,9 +1952,12 @@ void TaskProcessor::performRemoteSendDraft(Task * task) {
 
     if (account->usesSmarterMailAPI()) {
         if (multisend) throw SyncException("smartermail-multisend-unsupported", "Per-recipient customized sends are not supported by the native SmarterMail send operation. Disable tracking/customization and try again; no email was sent.", false);
-        shared_ptr<Message> parent = SmarterMailCompose::resolveParent(*store, draft);
-        auto payload = SmarterMailCompose::payload(draft, account->emailAddress(), body, plaintext, parent.get());
         SmarterMailClient client(account);
+        auto parent = SmarterMailCompose::resolveParent(*store, draft,
+            [&](const string & folder, const string & subject, const string & mid) {
+                return client.findMovedMessageUID(folder, subject, mid);
+            });
+        auto payload = SmarterMailCompose::payload(draft, account->emailAddress(), body, plaintext, parent.get());
         const string composeGuid = SmarterMailCompose::guid();
         json attachments = json::array(), names = json::array();
         const auto files = draft.files();

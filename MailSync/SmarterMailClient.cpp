@@ -1,4 +1,5 @@
 #include "SmarterMailClient.hpp"
+#include "MoveResult.hpp"
 #include "SmarterMailHeaders.hpp"
 #include "SmarterMailRawMessage.hpp"
 
@@ -284,6 +285,18 @@ SmarterMailPage SmarterMailClient::messages(const string & folder, unsigned int 
         break;
     }
     return page;
+}
+
+uint32_t SmarterMailClient::findMovedMessageUID(const string & folder, const string & subject,
+                                               const string & messageId) {
+    constexpr unsigned int recentPageSize = 50;
+    return MoveResult::movedMessageUID(messages(folder, 0, recentPageSize).messages, subject, messageId,
+        [&](uint32_t uid) {
+            auto detail = messageBody(folder, uid);
+            auto mid = MoveResult::messageId({{"header", std::move(detail.mime)}});
+            if (!mid.empty()) return mid;
+            return MoveResult::messageId({{"header", std::move(detail.structuredMime)}});
+        });
 }
 
 string SmarterMailClient::inlineAttachmentBytes(const string & relativeUrl) {

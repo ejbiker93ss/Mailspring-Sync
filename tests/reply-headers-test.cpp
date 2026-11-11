@@ -1,4 +1,5 @@
 #include "ReplyHeaders.hpp"
+#include "MoveResult.hpp"
 #include "SmarterMailCompose.hpp"
 #include "SmarterMailHeaders.hpp"
 #include "MailProcessor.hpp"
@@ -97,7 +98,33 @@ int main() {
     forwardData["id"] = "forward-draft";
     forwardData["replyToMessageId"] = placeholder.id();
     forwardData["fwdMsgId"] = "forward-parent@example.invalid";
+    forwardData["to"] = json::array({{{"email", "reports@example.invalid"}}});
     Message staleForward(forwardData);
+    auto movedData = placeholderData;
+    movedData["id"] = "pending-move";
+    movedData["remoteFolder"]["path"] = "Archive";
+    movedData["smPendingMove"] = {{"destinationFolder", "Archive"}, {"messageId", "<forward-parent@example.invalid> "}};
+    Message pendingMove(movedData); store.save(&pendingMove);
+    auto pendingDraftData = forwardData;
+    pendingDraftData["replyToMessageId"] = pendingMove.id();
+    Message pendingDraft(pendingDraftData);
+    auto lookup = [&](const std::string & destination, const std::string & subject, const std::string & mid) {
+        assert(destination == "Archive" && subject == "Ticket" && mid == "<forward-parent@example.invalid> ");
+        return MoveResult::movedMessageUID({{{"uid", 2143}, {"subject", "Ticket"}},
+                                           {{"uid", 2144}, {"subject", "Ticket"}}}, subject, mid,
+            [&](uint32_t uid) { return uid == 2143 ? mid : std::string("<different@example.invalid> "); });
+    };
+    auto movedParent = SmarterMailCompose::resolveParent(store, pendingDraft, lookup);
+    assert(movedParent && movedParent->id() == pendingMove.id());
+    auto movedForward = SmarterMailCompose::payload(pendingDraft, "me@example.invalid", "forward", true, movedParent.get());
+    assert(movedForward["replyUid"] == 2143 && movedForward["replyFromFolder"] == "Archive");
+    assert(movedForward["actions"]["Forwarded"] == true);
+    pendingDraft._data.erase("fwdMsgId");
+    pendingDraft._data["rthMsgId"] = "forward-parent@example.invalid";
+    movedParent = SmarterMailCompose::resolveParent(store, pendingDraft, lookup);
+    auto movedReply = SmarterMailCompose::payload(pendingDraft, "me@example.invalid", "reply", true, movedParent.get());
+    assert(movedReply["replyUid"] == 2143 && movedReply["actions"]["Replied"] == true);
+    assert(store.find<Message>(Query().equal("id", pendingMove.id()))->remoteUID() == UINT32_MAX - 1);
     auto recovered = SmarterMailCompose::resolveParent(store, staleForward);
     assert(recovered && recovered->id() == physical.id());
     auto recoveredPayload = SmarterMailCompose::payload(staleForward, "me@example.invalid", "forward", true, recovered.get());
@@ -107,6 +134,12 @@ int main() {
     duplicateData["v"] = 0;
     Message duplicate(duplicateData); store.save(&duplicate);
     assert(!SmarterMailCompose::resolveParent(store, staleForward));
+    const std::string quotedForward = "<p>Forwarded message</p><blockquote>Original body</blockquote>";
+    auto standalone = SmarterMailCompose::payload(staleForward, "me@example.invalid", quotedForward, false, nullptr);
+    assert(standalone["to"] == "reports@example.invalid" && standalone["messageHTML"] == quotedForward);
+    for (const char * key : {"replyUid", "replyFromFolder", "replyOwner", "isReply", "isForward", "actions"}) {
+        assert(!standalone.count(key));
+    }
     duplicateData["aid"] = "different-account";
     Message otherAccount(duplicateData); store.remove(&duplicate); store.save(&otherAccount);
     assert(SmarterMailCompose::resolveParent(store, staleForward)->id() == physical.id());
@@ -114,5 +147,7 @@ int main() {
     assert(ReplyHeaders::canonical("parent@host\r\nBcc: victim@host").empty());
     std::cout << "PASS: serialized reply MIME preserves exact parent, full ticket references, fresh ID; stale caches heal and placeholders cannot send\n";
     std::cout << "PASS: native SmarterMail payload uses numeric parent UID, folder, owner and reply/forward action, with no RFC header overrides\n";
+    std::cout << "PASS: standalone forward preserves its recipient and quoted body when no unique original can be resolved\n";
+    std::cout << "PASS: send uses the verified Archive UID immediately after a move without changing the sync cache\n";
   } catch (const std::exception & ex) { std::cerr << ex.what() << std::endl; return 1; }
 }
